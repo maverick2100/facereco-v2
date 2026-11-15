@@ -17,6 +17,9 @@ Usage:
     python main.py run --show cam01,cam02    # window shows only these cameras
     python main.py db-check                  # test the database connection (SQLite or PostgreSQL)
     python main.py cameras                   # what the camera source (cameras.yaml or your SP) returns
+    python main.py api                       # HTTP API for the frontend (cameras in, dashboard out) on :8090
+    python main.py run --api                 # pipelines + the API in one process
+    python main.py db-setup                  # create camera_config + the SPs in PostgreSQL (--force: re-apply)
 
 `run` follows the camera source: with FR_CAMERA_SOURCE=db it calls your stored procedure, starts face
 recognition / person counting per camera as the SP says, and restarts the pipelines when the SP's
@@ -48,7 +51,7 @@ import cv2  # noqa: E402
 cv2.setNumThreads(1)
 cv2.setUseOptimized(True)
 
-from config.settings import Settings, load_settings  # noqa: E402
+from config.settings import CameraSourceSettings, Settings, load_settings  # noqa: E402
 from constants import ENROLLMENT_DIR, EXPORTS_DIR  # noqa: E402
 from database.camera_repository import CameraRepository  # noqa: E402
 from database.connection import open_database  # noqa: E402
@@ -373,12 +376,62 @@ class Supervisor:
             self.source.close()
 
 
+def _auto_setup_sql(settings: Settings) -> None:
+    """FR_CAMERA_SOURCE=db on PostgreSQL: create camera_config + the SPs if they're missing."""
+    if not settings.api.auto_setup or settings.camera_source.source != "db" or \
+            settings.storage.backend != "postgres" or settings.camera_source.sql != CameraSourceSettings.sql:
+        return                                       # custom FR_CAMERA_SQL = your own SP: leave the DB alone
+    from database.sql_setup import ensure_sql_objects
+
+    db = None
+    try:
+        db = open_database(settings.storage)
+        ensure_sql_objects(db)
+    except Exception as exc:
+        log.warning("Could not create camera_config / SPs (%s) - run: python main.py db-setup", exc)
+    finally:
+        if db is not None:
+            db.close()
+
+
 def cmd_run(settings: Settings, args) -> int:
     only = set(args.cameras.split(",")) if args.cameras else None
     show = None
     if args.show is not None:
         show = [c for c in args.show.split(",") if c]
-    Supervisor(settings, CameraSource(settings.camera_source, settings.storage), show, only).run_forever()
+    _auto_setup_sql(settings)
+    api_server = None
+    if getattr(args, "api", False):
+        from api.server import serve_in_thread
+
+        api_server = serve_in_thread(settings)
+    try:
+        Supervisor(settings, CameraSource(settings.camera_source, settings.storage), show, only).run_forever()
+    finally:
+        if api_server is not None:
+            api_server.should_exit = True
+    return 0
+
+
+def cmd_api(settings: Settings, args) -> int:
+    from api.server import serve
+
+    serve(settings, args.host, args.port)
+    return 0
+
+
+def cmd_db_setup(settings: Settings, args) -> int:
+    from database.sql_setup import ensure_sql_objects
+
+    try:
+        db = open_database(settings.storage)
+        applied = ensure_sql_objects(db, force=args.force)
+    except Exception as exc:
+        print(f"FAILED: {exc}")
+        return 1
+    print(f"OK  {db.description}")
+    print("    applied: " + (", ".join(applied) if applied else "nothing (all objects exist; --force re-applies)"))
+    db.close()
     return 0
 
 
@@ -513,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--cameras", help="comma-separated camera ids (default: all enabled)")
     r.add_argument("--show", nargs="?", const="", metavar="CAMS",
                    help="open a window with live detections (optionally only these comma-separated cameras)")
+    r.add_argument("--api", action="store_true", help="also serve the HTTP API (FR_API_HOST:FR_API_PORT)")
 
     e = sub.add_parser("enroll", help="enrol faces")
     e.add_argument("--dir", default=str(ENROLLMENT_DIR), help="folder with one sub-folder per person")
@@ -544,6 +598,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("cameras", help="list the cameras + use cases the camera source (yaml or SP) returns")
 
     sub.add_parser("db-check", help="test the database connection and create tables")
+
+    a = sub.add_parser("api", help="HTTP API for the frontend (docs at /docs)")
+    a.add_argument("--host", help="bind address (default FR_API_HOST)")
+    a.add_argument("--port", type=int, help="port (default FR_API_PORT)")
+
+    ds = sub.add_parser("db-setup", help="create camera_config + stored procedures in PostgreSQL")
+    ds.add_argument("--force", action="store_true", help="re-apply the SQL files even if the objects exist")
     return p
 
 
@@ -556,11 +617,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         None: cmd_run, "run": cmd_run, "enroll": cmd_enroll, "persons": cmd_persons,
         "delete-person": cmd_delete_person, "export": cmd_export, "counts": cmd_counts, "info": cmd_info,
         "cameras": cmd_cameras,
-        "db-check": cmd_db_check,
+        "db-check": cmd_db_check, "api": cmd_api, "db-setup": cmd_db_setup,
     }
     if args.command is None:
         args.cameras = None
         args.show = None
+        args.api = False
     return commands[args.command](settings, args)
 
 

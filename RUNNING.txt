@@ -1,0 +1,272 @@
+FACERECO - HOW TO RUN
+=====================
+
+facereco watches RTSP cameras and runs two use cases on each one:
+  * face   = face recognition (who is this?)
+  * person = person detection + counting (how many people, who went IN / OUT)
+
+You choose per camera which use cases run. There are three ways to run it:
+
+  A. WITH DASHBOARD  - the frontend calls facereco's API          (section 4)
+  B. WITH YOUR OWN BACKEND - it calls the stored procedures (SPs)  (section 5)
+  C. WITHOUT DASHBOARD - cameras in a YAML file, no database setup (section 6)
+
+A and B can be used together: both write the same table.
+
+
+------------------------------------------------------------------------------
+1. FLOW DIAGRAM
+------------------------------------------------------------------------------
+
+  WITH DASHBOARD / BACKEND (A + B)
+
+  +-----------+   POST /cameras     +---------------+
+  | Dashboard | ------------------> | facereco API  |---+
+  | (frontend)| <------------------ | :8090         |   |  sp_upsert_camera(...)
+  +-----------+   GET /dashboard/*  +---------------+   |
+                                                        v
+  +--------------+  SELECT sp_upsert_camera(...)   +-------------------------------+
+  | Your backend | ------------------------------> | PostgreSQL                    |
+  | (optional)   |                                 |  camera_config  (cameras +    |
+  +--------------+                                 |                  use cases)   |
+                                                   |     | trigger:                |
+                                                   |     | NOTIFY camera_changed   |
+                                                   |     v                         |
+                                                   |  events / person_counts /     |
+                                                   |  person_crossings  (results)  |
+                                                   +-----|-----------------^-------+
+                                    sp_get_cameras()     |                 | results written
+                                    (within ~1 second)   v                 |
+  +---------+   RTSP video      +--------------------------------------------------+
+  | Cameras | ----------------> | facereco  (python main.py run --api)             |
+  +---------+                   |   face   -> SCRFD + ArcFace  (Neural Engine)     |
+                                |   person -> YOLOv7 + tracker + IN/OUT zone       |
+                                +--------------------------------------------------+
+
+  Step by step:
+   1. User saves a camera on the dashboard (name, RTSP URL, 2 checkboxes, zone)
+   2. Dashboard calls the API -> API calls sp_upsert_camera -> row in camera_config
+   3. Database trigger sends NOTIFY camera_changed
+   4. facereco wakes up, calls sp_get_cameras(), starts the checked use cases
+   5. Results are written to events / person_counts / person_crossings
+   6. Dashboard calls GET /dashboard/... -> API calls sp_dash_*() -> numbers
+
+  WITHOUT DASHBOARD (C)
+
+   config/cameras.yaml --> facereco --> SQLite file (data/) --> command-line reports
+
+
+------------------------------------------------------------------------------
+2. ONE-TIME SETUP (on the Mac that runs facereco)
+------------------------------------------------------------------------------
+
+Already done on the current Mac: Python 3.12, .venv, models converted.
+On a NEW Mac:
+
+  brew install python@3.12 gstreamer gobject-introspection pkg-config cairo ffmpeg
+  git clone https://github.com/maverick2100/facereco-v2.git
+  cd facereco-v2
+  /opt/homebrew/bin/python3.12 -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  cp .env.example .env
+  # copy the models/*.mlpackage folders from the old Mac (they are not in git)
+
+Every new terminal:
+
+  cd <facereco folder>
+  source .venv/bin/activate
+
+
+------------------------------------------------------------------------------
+3. WHAT YOU NEED TO CHANGE
+------------------------------------------------------------------------------
+
+3.1  .env  - face detector model  (REQUIRED for face recognition)
+
+     models/scrfd.mlpackage has no face landmarks, so face recognition
+     crashes on start with it. Use the det10g model:
+
+       FR_SCRFD_MODEL=models/scrfd_det10g.mlpackage
+
+3.2  .env  - database  (only for A and B)
+
+       FR_PG_HOST=192.168.1.50          # your PostgreSQL server
+       FR_PG_PORT=5432
+       FR_PG_USER=facereco
+       FR_PG_PASSWORD=your-password
+       FR_PG_DATABASE=facereco
+       FR_CAMERA_SOURCE=db              # read cameras from the database
+
+     (or one line: FR_DATABASE_URL=postgresql://user:pass@host:5432/dbname)
+     Leave all of these empty and FR_CAMERA_SOURCE=yaml for option C.
+
+3.3  .env  - API  (only for A)
+
+       FR_API_HOST=127.0.0.1            # 0.0.0.0 if the dashboard is on another machine
+       FR_API_PORT=8090
+       FR_API_KEY=                      # REQUIRED if FR_API_HOST=0.0.0.0
+       FR_API_CORS_ORIGINS=             # e.g. http://localhost:3000 for a browser dashboard
+       FR_API_TIMEZONE=Asia/Kolkata
+
+3.4  Faces  (only if any camera runs face recognition)
+
+     Put 3-10 photos per person in data/enrollment/<Person Name>/
+     then run:   python main.py enroll
+     check:      python main.py persons
+
+3.5  config/cameras.yaml  (only for option C)
+
+     Replace the 20 dummy cameras with your real RTSP URLs (see section 6).
+
+
+------------------------------------------------------------------------------
+4. OPTION A - RUN WITH DASHBOARD (frontend -> API)
+------------------------------------------------------------------------------
+
+Start (one command; tables and SPs are created automatically):
+
+  python main.py run --api
+
+  API docs with "Try it out":  http://127.0.0.1:8090/docs
+
+What the dashboard calls:
+
+  Add a camera (use cases start within ~1 second):
+    POST /cameras
+    {
+      "camera_id": "gate1",
+      "name": "Main Gate",
+      "url": "rtsp://admin:pass@192.168.1.101:554/Streaming/Channels/102",
+      "run_face": true,
+      "run_person": true,
+      "count_zone": [[0.5,0],[1,0],[1,1],[0.5,1]]     <- optional, for IN/OUT
+    }
+
+  Turn a use case on/off:   PATCH /cameras/gate1        {"run_face": false}
+  Change the zone:          PATCH /cameras/gate1        {"count_zone": [[...]]}
+  Stop / start a camera:    POST  /cameras/gate1/stop   POST /cameras/gate1/start
+  Delete a camera:          DELETE /cameras/gate1
+  List cameras + live state: GET /cameras        (state: streaming / starting / stopped)
+
+  Dashboard numbers (person counting):
+    GET /dashboard/summary             today's IN, OUT, inside now, unique people, peak
+    GET /dashboard/hourly              24 rows of IN / OUT
+    GET /dashboard/daily?from=2026-11-01&to=2026-11-16
+    GET /dashboard/cameras             one row per camera
+      filters: day=2026-11-16  cameras=gate1,hall2  tz=Asia/Kolkata
+
+  Face recognition results:
+    GET /events?known_only=true&limit=50
+
+  Status:  GET /status   GET /health
+
+Quick test from the terminal:
+
+  curl -X POST localhost:8090/cameras -H 'Content-Type: application/json' \
+    -d '{"camera_id":"gate1","name":"Main Gate","url":"rtsp://admin:pass@192.168.1.101/stream","run_person":true}'
+  curl localhost:8090/cameras
+  curl localhost:8090/dashboard/summary
+
+Notes:
+  * GET returns passwords as rtsp://admin:***@...  Sending that URL back keeps the
+    stored password.
+  * With FR_API_KEY set, every request needs the header  X-API-Key: <key>
+  * Changing any camera restarts all pipelines (a few seconds of no video).
+
+
+------------------------------------------------------------------------------
+5. OPTION B - YOUR OWN BACKEND CALLS THE STORED PROCEDURES
+------------------------------------------------------------------------------
+
+Start facereco (API optional):
+
+  python main.py run            # or run --api to have both
+
+Your backend runs SQL on the same database:
+
+  -- add / update a camera:  id, name, url, run_face, run_person, zone (optional)
+  SELECT sp_upsert_camera('gate1', 'Main Gate', 'rtsp://admin:pass@192.168.1.101/stream',
+                          true, true, '[[0.5,0],[1,0],[1,1],[0.5,1]]');
+
+  UPDATE camera_config SET enabled = false WHERE camera_id = 'gate1';   -- stop
+  UPDATE camera_config SET enabled = true  WHERE camera_id = 'gate1';   -- start
+  SELECT sp_delete_camera('gate1');                                     -- delete
+  SELECT * FROM sp_get_cameras();          -- what facereco is running
+
+  -- dashboard numbers
+  SELECT * FROM sp_dash_summary();
+  SELECT * FROM sp_dash_hourly_in_out();
+  SELECT * FROM sp_dash_daily_totals('2026-11-01', '2026-11-16');
+  SELECT * FROM sp_dash_camera_counts();
+  SELECT * FROM events ORDER BY ts DESC LIMIT 20;    -- recognised faces
+
+If the tables/SPs don't exist yet:  python main.py db-setup
+Plain INSERT / UPDATE / DELETE on camera_config work too (the trigger fires on any change).
+
+
+------------------------------------------------------------------------------
+6. OPTION C - RUN WITHOUT DASHBOARD (no database setup)
+------------------------------------------------------------------------------
+
+.env:
+  FR_CAMERA_SOURCE=yaml
+  FR_DATABASE_URL=            (empty)
+  FR_PG_HOST=                 (empty)     -> results go to a local SQLite file
+
+config/cameras.yaml:
+
+  defaults:
+    ...
+    tasks: [face]              # default use case for cameras without "tasks"
+
+  cameras:
+    - camera_id: gate1
+      name: Main Gate
+      url: rtsp://admin:pass@192.168.1.101:554/Streaming/Channels/102
+      tasks: [face, person]                               # both use cases
+      count_zone: [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]    # optional, IN/OUT
+
+    - camera_id: hall2
+      name: Hall
+      url: rtsp://admin:pass@192.168.1.102:554/Streaming/Channels/102
+      tasks: [person]                                     # counting only
+
+Run:
+  python scripts/test_gstreamer.py --cameras gate1,hall2   # check cameras stream
+  python main.py run --show      # --show = live window with boxes (q to quit)
+
+Edits to cameras.yaml are picked up within 30 seconds, no restart needed.
+
+See results:
+  python main.py counts --since 2026-11-16     # people / IN / OUT per camera
+  python main.py export --since 2026-11-16     # face events -> CSV in data/exports/
+  curl localhost:8085/cameras                  # which cameras are streaming
+
+Moving to the database later:  python scripts/migrate_sqlite_to_postgres.py
+
+
+------------------------------------------------------------------------------
+7. CHECKS AND TROUBLESHOOTING
+------------------------------------------------------------------------------
+
+  python main.py db-check       database connection works, tables created
+  python main.py cameras        cameras + use cases facereco would run right now
+  curl localhost:8085/health    facereco is running (only while a camera runs)
+  curl localhost:8085/metrics   fps, CPU, inference load
+  logs/face_recognition.log     full log
+
+  Startup log should say e.g.:  Starting with 2 cameras (face: 1, person: 2)
+
+  Problem                                   Fix
+  ----------------------------------------  ------------------------------------------
+  "Unrecognised SCRFD outputs"              FR_SCRFD_MODEL=models/scrfd_det10g.mlpackage
+  Every face is "unknown"                   enrol people (section 3.4)
+  Camera saved but nothing starts           FR_CAMERA_SOURCE=db in .env
+  "No enabled cameras ... waiting"          normal: idle until a camera is added/enabled
+  API: "The API needs PostgreSQL"           set FR_PG_* or FR_DATABASE_URL
+  401 from the API                          send header X-API-Key
+  Browser dashboard blocked (CORS)          add its origin to FR_API_CORS_ORIGINS
+  Camera never streams                      test the URL in VLC; try codec: h265 or auto
+
+Stop facereco: Ctrl+C (or q in the --show window). Counts are saved before it exits.

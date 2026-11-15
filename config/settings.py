@@ -268,6 +268,17 @@ class CameraSourceSettings:
 
 
 @dataclass
+class ApiSettings:
+    """HTTP API for the frontend (python main.py api, or run --api)."""
+    host: str = "127.0.0.1"          # 0.0.0.0 to accept requests from other machines
+    port: int = 8090
+    api_key: str = ""                # when set, every request needs the header X-API-Key: <key>
+    cors_origins: List[str] = field(default_factory=list)   # browser origins allowed to call the API
+    timezone: str = "Asia/Kolkata"   # default time zone for dashboard days / hours
+    auto_setup: bool = True          # create camera_config + the SPs on start if they're missing
+
+
+@dataclass
 class Settings:
     models: ModelSettings = field(default_factory=ModelSettings)
     detection: DetectionSettings = field(default_factory=DetectionSettings)
@@ -278,6 +289,7 @@ class Settings:
     monitoring: MonitoringSettings = field(default_factory=MonitoringSettings)
     cameras: List[CameraConfig] = field(default_factory=list)
     camera_source: CameraSourceSettings = field(default_factory=CameraSourceSettings)
+    api: ApiSettings = field(default_factory=ApiSettings)
     log_level: str = "INFO"
     logging_config: Path = CONFIG_DIR / "logging.yaml"
 
@@ -428,6 +440,14 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
             defaults=load_camera_defaults(cams_path),
             yaml_path=cams_path,
         ),
+        api=ApiSettings(
+            host=str(_env("FR_API_HOST", "127.0.0.1")),
+            port=_env("FR_API_PORT", 8090),
+            api_key=os.environ.get("FR_API_KEY", "").strip(),
+            cors_origins=[o.strip() for o in str(_env("FR_API_CORS_ORIGINS", "")).split(",") if o.strip()],
+            timezone=str(_env("FR_API_TIMEZONE", "Asia/Kolkata")),
+            auto_setup=_env("FR_API_AUTO_SETUP", True),
+        ),
         log_level=str(_env("FR_LOG_LEVEL", "INFO")).upper(),
         logging_config=_env_path("FR_LOGGING_CONFIG", CONFIG_DIR / "logging.yaml"),
     )
@@ -449,6 +469,8 @@ def _validate(s: Settings) -> None:
     if s.camera_source.notify_channel and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}",
                                                             s.camera_source.notify_channel):
         raise ValueError("FR_CAMERA_NOTIFY_CHANNEL must be a plain identifier (letters, digits, _)")
+    if not 0 < s.api.port < 65536:
+        raise ValueError("FR_API_PORT must be 1-65535")
     if s.camera_source.poll_s <= 0:
         raise ValueError("FR_CAMERA_POLL_S must be > 0")
     if s.person.zone_anchor not in ("bottom", "center"):

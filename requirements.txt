@@ -24,6 +24,10 @@ PyGObject==3.58.1
 psycopg[binary]==3.3.9
 psycopg-pool==3.3.3
 
+# --- HTTP API for the frontend (python main.py api / run --api)
+fastapi==0.163.1
+uvicorn==0.54.0
+
 # --- model conversion: ONNX -> Core ML (scripts/convert_models.py) and ONNX reference checks
 torch==2.5.1
 onnx==1.23.2
@@ -32,4 +36,5 @@ onnxruntime==1.32.0
 
 # --- tests (+ yt-dlp for scripts/dummy_rtsp.py: YouTube videos as dummy RTSP cameras)
 pytest==9.2.0
+httpx==0.28.1            # FastAPI TestClient (tests/test_api.py)
 yt-dlp==2026.10.26

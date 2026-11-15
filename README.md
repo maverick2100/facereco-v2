@@ -135,6 +135,33 @@ FR_CAMERA_SQL=SELECT * FROM sp_get_cameras()   # or your own SP / query
 - **End-to-end test:** `python scripts/e2e_test.py` adds two temporary cameras through the SPs and checks the whole chain against your database: pipelines start, face events, person counts and IN/OUT crossings arrive, a use-case change via the SP restarts within seconds, and a disabled camera stops. Then it removes them. Add `--fake-models` to test without `.mlpackage` files, or `--face-url` / `--person-url file:///clip.mp4` to use real video with the real models.
 - **Check it:** `python main.py cameras` prints what the SP returns, including which cameras run face, which run person counting, and which have a zone, without starting anything.
 
+### 3d. Optional: HTTP API for the frontend
+
+With PostgreSQL and `FR_CAMERA_SOURCE=db`, facereco serves an API, so a frontend can manage cameras and read the dashboard without a backend of its own:
+
+```bash
+python main.py run --api        # pipelines + API in one process (or: python main.py api, API only)
+open http://127.0.0.1:8090/docs # every endpoint, with a "Try it out" button
+```
+
+On start-up, facereco creates `camera_config` and all SPs if they're missing (`FR_API_AUTO_SETUP`; `python main.py db-setup` does it by hand). The API and a backend calling the SPs directly both write the same table, so use either or both. A camera added with `sp_upsert_camera` shows up in `GET /cameras`, and one added through the API is returned by `sp_get_cameras()`. Either way, its use cases start within about a second.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /cameras` | Add a camera: `{"camera_id", "name", "url", "run_face", "run_person", "count_zone"?, ...}` |
+| `PUT /cameras/{id}` | Add or replace (201 = created, 200 = updated) |
+| `PATCH /cameras/{id}` | Change only the fields sent, e.g. `{"run_face": true}` or a new `count_zone` |
+| `POST /cameras/{id}/start` · `/stop` | Turn a camera on or off (settings kept) |
+| `DELETE /cameras/{id}` | Remove a camera |
+| `GET /cameras` · `/cameras/{id}` | Cameras with `use_cases`, `state` (`streaming` / `starting` / `stopped` / ...) and live fps |
+| `GET /dashboard/summary` · `/hourly` · `/daily` · `/cameras` | Person-count numbers (`sp_dash_*`); filters `day`, `from`/`to`, `cameras=a,b`, `tz` |
+| `GET /events` | Recognised faces, newest first; filters `since`, `until`, `camera`, `known_only`, `limit` |
+| `GET /status` · `/health` | API, database and facereco status |
+
+- **Passwords:** `GET` returns camera URLs as `rtsp://user:***@host/...`. Sending that URL back unchanged keeps the stored password.
+- **Validation:** bad input (non-stream URL, zone with fewer than 3 points, unknown field) gets a 422 with the reason, before anything reaches facereco.
+- **Security:** the API listens on `127.0.0.1` by default. To serve other machines, set `FR_API_HOST=0.0.0.0` and `FR_API_KEY` (clients send `X-API-Key`). For a browser app on another origin, list it in `FR_API_CORS_ORIGINS`.
+
 ### 4. Add the models
 
 ```
