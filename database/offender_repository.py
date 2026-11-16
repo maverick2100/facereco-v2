@@ -1,6 +1,7 @@
 """PostgreSQL bridge to the offender search function."""
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -8,6 +9,20 @@ from typing import Any, Dict
 import numpy as np
 
 from database.connection import Database
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def offender_table_sql() -> str:
+    """Return a safely quoted FR_OFFENDER_TABLE name (schema.table; default public.tbl_offenders)."""
+    raw = os.getenv("FR_OFFENDER_TABLE", "public.tbl_offenders").strip()
+    parts = raw.split(".")
+    if len(parts) == 1:
+        parts.insert(0, "public")
+    if len(parts) != 2 or any(not _IDENTIFIER.fullmatch(part) for part in parts):
+        raise ValueError("FR_OFFENDER_TABLE must be a table name or schema.table using SQL identifiers")
+    return ".".join('"' + part.replace('"', '""') + '"' for part in parts)
 
 
 class OffenderRepository:

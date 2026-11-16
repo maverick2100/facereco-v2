@@ -18,6 +18,7 @@ import numpy as np
 
 from constants import ENROLLMENT_DIR, IMAGE_EXTENSIONS
 from database.embedding_repository import EmbeddingRepository
+from database.offender_repository import offender_table_sql
 from database.person_repository import PersonRepository
 from inference.inference_manager import InferenceManager
 from processing.face_alignment import norm_crop
@@ -115,7 +116,7 @@ class EnrollmentService:
             if mapping is None:
                 # Migrate/link rows created by the earlier one-vector-per-person implementation.
                 mapping = db.fetchone(
-                    "SELECT offender_id FROM public.tbl_offenders WHERE offender_name = ? AND imagepath = ? "
+                    f"SELECT offender_id FROM {offender_table_sql()} WHERE offender_name = ? AND imagepath = ? "
                     "AND loginid = ? ORDER BY offender_id LIMIT 1",
                     (name, imagepath, OFFENDER_LOGIN_ID),
                 )
@@ -123,7 +124,7 @@ class EnrollmentService:
                 offender_id = int(mapping["offender_id"])
                 if replace:
                     db.execute(
-                        "UPDATE public.tbl_offenders SET embedding = ?, is_active = TRUE, updated_by = ?, "
+                        f"UPDATE {offender_table_sql()} SET embedding = ?, is_active = TRUE, updated_by = ?, "
                         "updated_date = CURRENT_TIMESTAMP WHERE offender_id = ?",
                         (np.asarray(embedding, dtype=np.float64).reshape(-1).tolist(),
                          OFFENDER_LOGIN_ID, offender_id),

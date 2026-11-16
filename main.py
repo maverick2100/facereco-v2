@@ -57,6 +57,7 @@ from database.camera_repository import CameraRepository  # noqa: E402
 from database.connection import open_database  # noqa: E402
 from database.embedding_repository import EmbeddingRepository  # noqa: E402
 from database.event_repository import EventRepository  # noqa: E402
+from database.offender_repository import offender_table_sql  # noqa: E402
 from database.person_count_repository import PersonCountRepository  # noqa: E402
 from database.person_repository import PersonRepository  # noqa: E402
 from database.schema import init_schema  # noqa: E402
@@ -181,7 +182,7 @@ class FaceRecognitionApp:
             extra.update({
                 "scheduler": lambda: {k: v for k, v in self.scheduler.stats().items() if k != "per_camera"},
                 "pipeline": self.recognition.stats,
-                "gallery": lambda: {"source": "public.tbl_offenders"},
+                "gallery": lambda: {"source": offender_table_sql()},
             })
         if self.person_service is not None:
             extra.update({

@@ -6,6 +6,7 @@ import time
 
 from constants import SCHEMA_VERSION
 from database.connection import Database
+from database.offender_repository import offender_table_sql
 
 log = logging.getLogger(__name__)
 
@@ -210,7 +211,7 @@ def _add_missing_columns(db: Database) -> None:
 def init_schema(db: Database) -> None:
     db.executescript(PG_SCHEMA_SQL if getattr(db, "backend", "sqlite") == "postgres" else SCHEMA_SQL)
     if getattr(db, "backend", "sqlite") == "postgres":
-        db.executescript(OFFENDERS_PG_SQL)
+        db.executescript(OFFENDERS_PG_SQL.replace("__OFFENDER_TABLE__", offender_table_sql()))
     _add_missing_columns(db)
     row = db.fetchone("SELECT MAX(version) AS v FROM schema_version")
     current = row["v"] if row and row["v"] is not None else 0
@@ -221,7 +222,7 @@ def init_schema(db: Database) -> None:
 
 
 OFFENDERS_PG_SQL = """
-CREATE TABLE IF NOT EXISTS public.tbl_offenders (
+CREATE TABLE IF NOT EXISTS __OFFENDER_TABLE__ (
     offender_id   SERIAL PRIMARY KEY,
     offender_name VARCHAR NOT NULL,
     embedding     DOUBLE PRECISION[] NOT NULL,
@@ -233,11 +234,11 @@ CREATE TABLE IF NOT EXISTS public.tbl_offenders (
     updated_date  TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS imagepath TEXT;
-ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS created_by INTEGER;
-ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS updated_by INTEGER;
-ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS updated_date TIMESTAMP WITHOUT TIME ZONE
+ALTER TABLE __OFFENDER_TABLE__ ADD COLUMN IF NOT EXISTS imagepath TEXT;
+ALTER TABLE __OFFENDER_TABLE__ ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE __OFFENDER_TABLE__ ADD COLUMN IF NOT EXISTS created_by INTEGER;
+ALTER TABLE __OFFENDER_TABLE__ ADD COLUMN IF NOT EXISTS updated_by INTEGER;
+ALTER TABLE __OFFENDER_TABLE__ ADD COLUMN IF NOT EXISTS updated_date TIMESTAMP WITHOUT TIME ZONE
     NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
 CREATE TABLE IF NOT EXISTS public.offender_sync (
@@ -278,7 +279,7 @@ PARALLEL UNSAFE
 ROWS 1000
 AS $$
 BEGIN
-    INSERT INTO public.tbl_offenders
+    INSERT INTO __OFFENDER_TABLE__
         (offender_name, embedding, loginid, imagepath, is_active, created_by, updated_by, updated_date)
     VALUES (p_offender_name, p_embedding, p_loginid, p_imagepath, TRUE, p_loginid, p_loginid, CURRENT_TIMESTAMP)
     RETURNING offender_id INTO new_offender_id;
@@ -333,7 +334,7 @@ DECLARE
 BEGIN
     SELECT o.offender_name, o.offender_id, o.loginid, score.cosine_similarity
       INTO v_name, v_offender_id, v_loginid, v_similarity
-      FROM public.tbl_offenders o
+      FROM __OFFENDER_TABLE__ o
       CROSS JOIN LATERAL (
           SELECT SUM(q.value * o.embedding[q.ordinality::INTEGER]) /
                  NULLIF(SQRT(SUM(q.value * q.value) * SUM(o.embedding[q.ordinality::INTEGER] *
