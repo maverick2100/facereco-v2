@@ -139,6 +139,26 @@ class PersonCounter:
         with self._lock:
             return self.cameras[camera_id].update(boxes, ts, mono_ts)
 
+    def seed_totals(self, totals: Dict[str, Dict[str, int]]) -> List[str]:
+        """Continue from stored totals: {camera_id: {"total", "in", "out"}}. Returns the cameras seeded."""
+        seeded = []
+        with self._lock:
+            for cid, vals in totals.items():
+                cam = self.cameras.get(cid)
+                if cam is None:
+                    continue
+                cam.total_persons = vals.get("total", cam.total_persons)
+                if cam.zone is not None:
+                    cam.zone.total_in = vals.get("in", cam.zone.total_in)
+                    cam.zone.total_out = vals.get("out", cam.zone.total_out)
+                seeded.append(cid)
+        return seeded
+
+    def in_out_totals(self) -> Dict[str, Tuple[int, int]]:
+        """Running IN / OUT totals of the cameras that have a count_zone."""
+        with self._lock:
+            return {cid: (c.zone.total_in, c.zone.total_out) for cid, c in self.cameras.items() if c.zone is not None}
+
     def due(self) -> bool:
         return time.monotonic() - self._last_flush >= self.interval_s
 

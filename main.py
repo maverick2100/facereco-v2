@@ -51,7 +51,7 @@ import cv2  # noqa: E402
 cv2.setNumThreads(1)
 cv2.setUseOptimized(True)
 
-from config.settings import CameraSourceSettings, Settings, load_settings  # noqa: E402
+from config.settings import Settings, load_settings  # noqa: E402
 from constants import ENROLLMENT_DIR, EXPORTS_DIR  # noqa: E402
 from database.camera_repository import CameraRepository  # noqa: E402
 from database.connection import open_database  # noqa: E402
@@ -379,8 +379,8 @@ class Supervisor:
 def _auto_setup_sql(settings: Settings) -> None:
     """FR_CAMERA_SOURCE=db on PostgreSQL: create camera_config + the SPs if they're missing."""
     if not settings.api.auto_setup or settings.camera_source.source != "db" or \
-            settings.storage.backend != "postgres" or settings.camera_source.sql != CameraSourceSettings.sql:
-        return                                       # custom FR_CAMERA_SQL = your own SP: leave the DB alone
+            settings.storage.backend != "postgres" or "sp_get_cameras" not in settings.camera_source.sql:
+        return                                       # your own SP (e.g. fn_get_device_configuration): leave the DB alone
     from database.sql_setup import ensure_sql_objects
 
     db = None

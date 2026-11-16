@@ -165,6 +165,8 @@ class PersonSettings:
     flush_interval_s: float = 60.0   # one count row per camera per interval is appended to the DB
     zone_anchor: str = "bottom"      # point of the box tested against count_zone: bottom (feet) | center
     zone_min_frames: int = 2         # frames a person must stay on the new side before IN/OUT counts
+    init_sql: str = "SELECT * FROM public.fn_initialize_device_personcount()"  # starting totals ("" = start at 0)
+    update_sql: str = "CALL sp_upsert_person_count_update(?, ?, ?, ?)"  # (device, in, out, time); "" = off
 
 
 @dataclass
@@ -260,7 +262,7 @@ class MonitoringSettings:
 class CameraSourceSettings:
     """Where the camera list (and each camera's use case) comes from."""
     source: str = "yaml"                          # yaml (config/cameras.yaml) | db (your stored procedure)
-    sql: str = "SELECT * FROM sp_get_cameras()"   # db: any query / SP call returning one row per camera
+    sql: str = "SELECT * FROM public.fn_get_device_configuration()"   # db: any query / SP call, one row per camera
     poll_s: float = 30.0                          # re-check the camera list this often (both sources)
     notify_channel: str = "camera_changed"        # PostgreSQL: LISTEN here for instant reloads ("" = off)
     defaults: Dict[str, Any] = field(default_factory=dict)   # cameras.yaml `defaults:`, applied to DB rows
@@ -363,6 +365,8 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         flush_interval_s=_env("FR_PERSON_FLUSH_S", 60.0),
         zone_anchor=_env("FR_PERSON_ZONE_ANCHOR", "bottom"),
         zone_min_frames=_env("FR_PERSON_ZONE_MIN_FRAMES", 2),
+        init_sql=_env("FR_PERSON_INIT_SQL", PersonSettings.init_sql),
+        update_sql=_env("FR_PERSON_UPDATE_SQL", PersonSettings.update_sql),
     )
     d = DetectionSettings(
         det_threshold=_env("FR_DET_THRESHOLD", 0.5),
@@ -434,7 +438,7 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         cameras=load_cameras(cams_path),
         camera_source=CameraSourceSettings(
             source=str(_env("FR_CAMERA_SOURCE", "yaml")).lower(),
-            sql=_env("FR_CAMERA_SQL", "SELECT * FROM sp_get_cameras()"),
+            sql=_env("FR_CAMERA_SQL", CameraSourceSettings.sql),
             poll_s=_env("FR_CAMERA_POLL_S", 30.0),
             notify_channel=_env("FR_CAMERA_NOTIFY_CHANNEL", "camera_changed"),
             defaults=load_camera_defaults(cams_path),

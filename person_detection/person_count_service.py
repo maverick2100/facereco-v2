@@ -56,6 +56,7 @@ class PersonCountService:
                                      zones={c.camera_id: c.count_zone for c in cameras if c.count_zone},
                                      zone_anchor=settings.zone_anchor, zone_min_frames=settings.zone_min_frames)
         self._last_crossing_write = 0.0
+        self._pushed: Dict[str, tuple] = {}   # camera_id -> (in, out) last sent to the update SP
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -70,7 +71,27 @@ class PersonCountService:
         if iterations:
             log.info("YOLOv7 warm-up done in %.2fs", time.perf_counter() - t0)
 
+    def load_initial_totals(self) -> None:
+        """Step 1: get each device's total so far (FR_PERSON_INIT_SQL) and count on from there."""
+        sql = (self.settings.init_sql or "").strip()
+        if not sql:
+            return
+        try:
+            totals = self.repo.initial_totals(sql)
+        except Exception as exc:
+            log.warning("Starting totals query failed (%s) - counting starts at 0: %s", exc, sql)
+            return
+        seeded = self.counter.seed_totals(totals)
+        self._pushed.update(self.counter.in_out_totals())   # already stored: don't send them back unchanged
+        missing = sorted(set(self.cameras) - set(seeded))
+        for cid in seeded:
+            log.info("Camera %s: starting totals %s", cid, totals[cid])
+        if missing:
+            log.warning("No starting totals for camera(s) %s (SP returned ids: %s) - those start at 0",
+                        ", ".join(missing), ", ".join(sorted(totals)) or "none")
+
     def start(self) -> None:
+        self.load_initial_totals()
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="person-detector", daemon=True)
         self._thread.start()
@@ -126,6 +147,7 @@ class PersonCountService:
             return
         self._last_crossing_write = now
         rows = self.counter.take_crossings()
+        self._push_totals()
         if not rows:
             return
         try:
@@ -133,6 +155,23 @@ class PersonCountService:
             self.perf.incr("person_crossings", len(rows))
         except Exception:
             log.exception("Failed to write %d zone crossings", len(rows))
+
+    def _push_totals(self) -> None:
+        """Step 2: send each camera's changed IN / OUT totals to the update SP (FR_PERSON_UPDATE_SQL)."""
+        sql = (self.settings.update_sql or "").strip()
+        if not sql:
+            return
+        changed = {cid: v for cid, v in self.counter.in_out_totals().items() if self._pushed.get(cid) != v}
+        if not changed:
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        for cid, (n_in, n_out) in changed.items():
+            device = int(cid) if cid.isdigit() else cid
+            try:
+                self.repo.push_totals(sql, [(device, n_in, n_out, stamp)])
+                self._pushed[cid] = (n_in, n_out)
+            except Exception:
+                log.exception("Count update failed for camera %s (in=%d out=%d) - retrying", cid, n_in, n_out)
 
     def _write(self, records: List[CountRecord]) -> None:
         if not records:
