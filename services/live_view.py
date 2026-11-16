@@ -25,8 +25,7 @@ REJECTED = "rejected"    # failed the quality gate (blurry, side-on, small)
 # BGR
 _FACE_COLORS = {KNOWN: (0, 200, 0), UNKNOWN: (0, 0, 230), PENDING: (200, 200, 200), REJECTED: (120, 120, 120)}
 _PERSON_COLOR = (230, 160, 0)
-_ROI_COLOR = (0, 220, 255)
-_ZONE_COLOR = (255, 0, 200)
+_LINE_COLOR = (0, 220, 255)
 _STALE_S = 1.5           # drop boxes that are older than this relative to the frame shown
 
 WINDOW = "facereco - q / Esc to quit"
@@ -60,11 +59,11 @@ def _iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 class LiveView:
-    def __init__(self, cameras: Dict[str, str], rois: Optional[Dict[str, Optional[Sequence[int]]]] = None,
-                 window_width: int = 1600, zones: Optional[Dict[str, Optional[Sequence]]] = None) -> None:
-        """cameras: camera_id -> display name (only these are shown). zones: camera_id -> count_zone polygon."""
-        self.rois = dict(rois or {})
-        self.zones = {k: np.asarray(v, np.float32) for k, v in (zones or {}).items() if v}
+    def __init__(self, cameras: Dict[str, str], window_width: int = 1600,
+                 lines: Optional[Dict[str, Tuple[Sequence[float], str]]] = None) -> None:
+        """cameras: camera_id -> display name (only these are shown).
+        lines: camera_id -> ([x1, y1, x2, y2] count line in pixels, IN direction down|up|right|left)."""
+        self.lines = {k: v for k, v in (lines or {}).items() if v and v[0]}
         self.window_width = window_width
         self._slots: Dict[str, _Slot] = {cid: _Slot(name) for cid, name in cameras.items()}
         self._lock = threading.Lock()
@@ -96,7 +95,7 @@ class LiveView:
                 s.image, s.image_ts = image, ts
 
     # ------------------------------------------------------------------ drawing
-    def _tile(self, s: _Slot, roi, w: int, h: int, status: str, zone: Optional[np.ndarray] = None) -> np.ndarray:
+    def _tile(self, s: _Slot, w: int, h: int, status: str, line=None) -> np.ndarray:
         if s.image is None:
             tile = np.zeros((h, w, 3), np.uint8)
             cv2.putText(tile, "waiting for frames...", (12, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -121,12 +120,8 @@ class LiveView:
                     cv2.putText(tile, label, (x1 + 4, ty - base + 1), cv2.FONT_HERSHEY_SIMPLEX, fs,
                                 (0, 0, 0) if color != _FACE_COLORS[UNKNOWN] else (255, 255, 255), 1, cv2.LINE_AA)
 
-            if roi is not None:
-                x1, y1, x2, y2 = (int(round(v * scale)) for v in roi)
-                cv2.rectangle(tile, (x1 + ox, y1 + oy), (x2 + ox, y2 + oy), _ROI_COLOR, 1)
-            if zone is not None:
-                pts = np.round(zone * scale + (ox, oy)).astype(np.int32)
-                cv2.polylines(tile, [pts], True, _ZONE_COLOR, 2, cv2.LINE_AA)
+            if line is not None:
+                _draw_line(tile, line[0], line[1], scale, ox, oy, fs)
             if s.persons is not None and abs(s.persons_ts - s.image_ts) <= _STALE_S:
                 for d in s.persons:
                     box(d, _PERSON_COLOR, f"person {d[4]:.2f}" if len(d) > 4 else "person")
@@ -156,8 +151,8 @@ class LiveView:
         canvas = np.zeros((rows * th, cols * tw, 3), np.uint8)
         for i, (cid, s) in enumerate(items):
             r, c = divmod(i, cols)
-            canvas[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = self._tile(s, self.rois.get(cid), tw, th,
-                                                                          status.get(cid, ""), self.zones.get(cid))
+            canvas[r * th:(r + 1) * th, c * tw:(c + 1) * tw] = self._tile(s, tw, th, status.get(cid, ""),
+                                                                          self.lines.get(cid))
         return canvas
 
     # ------------------------------------------------------------------ main-thread loop
@@ -177,3 +172,23 @@ class LiveView:
         finally:
             cv2.destroyAllWindows()
             cv2.waitKey(1)
+
+
+def _draw_line(tile: np.ndarray, line: Sequence[float], in_direction: str, scale: float, ox: int, oy: int,
+               fs: float) -> None:
+    """The count line plus an arrow from its middle pointing the IN way."""
+    x1, y1, x2, y2 = (float(v) * scale for v in line)
+    a, b = (int(round(x1 + ox)), int(round(y1 + oy))), (int(round(x2 + ox)), int(round(y2 + oy)))
+    cv2.line(tile, a, b, _LINE_COLOR, 2, cv2.LINE_AA)
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / length, dx / length                       # normal; flip so it points down / right
+    if (abs(dx) >= abs(dy) and ny < 0) or (abs(dx) < abs(dy) and nx < 0):
+        nx, ny = -nx, -ny
+    if in_direction in ("up", "left"):
+        nx, ny = -nx, -ny
+    mx, my = (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0
+    k = max(18.0, min(40.0, length * 0.15))
+    tip = (int(round(mx + nx * k)), int(round(my + ny * k)))
+    cv2.arrowedLine(tile, (int(round(mx)), int(round(my))), tip, _LINE_COLOR, 2, cv2.LINE_AA, tipLength=0.35)
+    cv2.putText(tile, "IN", (tip[0] + 4, tip[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, fs, _LINE_COLOR, 1, cv2.LINE_AA)

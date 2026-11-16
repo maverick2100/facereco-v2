@@ -66,7 +66,6 @@ def restore_password(new_url: str, old_url: Optional[str]) -> str:
 
 
 # ------------------------------------------------------------------------------------------- request models
-Point = List[float]
 
 
 class CameraFields(BaseModel):
@@ -78,10 +77,9 @@ class CameraFields(BaseModel):
                                examples=["rtsp://admin:pass@192.168.1.101:554/Streaming/Channels/102"])
     run_face: Optional[bool] = Field(None, description="use case: face recognition")
     run_person: Optional[bool] = Field(None, description="use case: person detection + IN/OUT counting")
-    count_zone: Optional[List[Point]] = Field(
-        None, description="IN/OUT polygon, >= 3 [x, y] points: 0..1 fractions of the frame, or pixels",
-        examples=[[[0.5, 0], [1, 0], [1, 1], [0.5, 1]]])
-    roi: Optional[List[int]] = Field(None, description="[x1, y1, x2, y2] in pixels; only this part is analysed")
+    roi: Optional[List[float]] = Field(
+        None, description="IN/OUT count line [x1, y1, x2, y2] (its two ends): pixels or 0..1 fractions of the frame",
+        examples=[[0.0, 0.6, 1.0, 0.6]])
     location: Optional[str] = Field(None, max_length=200)
     enabled: Optional[bool] = Field(None, description="false = camera stopped (kept in the list)")
     fps: Optional[float] = Field(None, gt=0, le=30, description="frames/s analysed (null = default)")
@@ -100,24 +98,15 @@ class CameraFields(BaseModel):
             raise ValueError(f"must be a camera stream URL ({', '.join(s + '://' for s in URL_SCHEMES)})")
         return v
 
-    @field_validator("count_zone")
-    @classmethod
-    def _zone(cls, v):
-        if v is None:
-            return v
-        if len(v) < 3 or any(len(p) != 2 for p in v):
-            raise ValueError("needs at least 3 [x, y] points")
-        if any(c < 0 for p in v for c in p):
-            raise ValueError("coordinates must be >= 0")
-        return v
-
     @field_validator("roi")
     @classmethod
     def _roi(cls, v):
         if v is None:
             return v
-        if len(v) != 4 or v[0] >= v[2] or v[1] >= v[3] or min(v) < 0:
-            raise ValueError("must be [x1, y1, x2, y2] with x1 < x2 and y1 < y2")
+        if len(v) != 4 or min(v) < 0:
+            raise ValueError("must be a line [x1, y1, x2, y2] with coordinates >= 0")
+        if v[0] == v[2] and v[1] == v[3]:
+            raise ValueError("the line's two ends are the same point")
         return v
 
 
@@ -217,6 +206,8 @@ def create_app(settings: Settings, db=None) -> FastAPI:
     def _public(row: dict, live: Optional[dict] = None) -> dict:
         out = dict(row)
         out["url"] = mask_password(out["url"])
+        if not out.get("run_person"):
+            out["roi"] = None
         out["use_cases"] = [n for n, on in (("face", out["run_face"]), ("person", out["run_person"])) if on]
         running = out["enabled"] and bool(out["use_cases"])
         out["state"] = "stopped" if not running else (live or {}).get("status", "starting")
@@ -245,6 +236,8 @@ def create_app(settings: Settings, db=None) -> FastAPI:
 
     def _save(d, camera_id: str, f: Dict[str, Any]) -> None:
         """Validate the merged camera the same way facereco will, then sp_upsert_camera."""
+        if not f["run_person"]:
+            f["roi"] = None
         check = {**f, "camera_id": camera_id, "enabled": True,
                  "tasks": [t for t, on in (("face", f["run_face"]), ("person", f["run_person"])) if on] or ["face"]}
         try:
@@ -257,7 +250,7 @@ def create_app(settings: Settings, db=None) -> FastAPI:
             "p_location => ?::text, p_enabled => ?::boolean, p_fps => ?::real, p_width => ?::integer, "
             "p_height => ?::integer, p_roi => ?::jsonb, p_codec => ?::text)",
             (camera_id, f["name"], f["url"], f["run_face"], f["run_person"],
-             json.dumps(f["count_zone"]) if f.get("count_zone") else None, f.get("location") or "",
+             None, f.get("location") or "",                       # count_zone: replaced by the roi line
              f["enabled"], f.get("fps"), f.get("width"), f.get("height"),
              json.dumps(f["roi"]) if f.get("roi") else None, f.get("codec")))
 

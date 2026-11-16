@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from person_detection.person_tracker import PersonTracker
-from person_detection.zone_counter import Crossing, ZoneCounter
+from person_detection.line_counter import Crossing, LineCounter
 
 
 @dataclass
@@ -27,9 +27,9 @@ class CountRecord:
     max_count: int
     avg_count: float
     new_persons: int
-    in_count: int = 0        # zone crossings outside -> inside during the interval
-    out_count: int = 0       # zone crossings inside -> outside
-    zone_count: int = 0      # people inside the zone at the end of the interval
+    in_count: int = 0        # IN crossings of the roi line during the interval
+    out_count: int = 0       # OUT crossings of the roi line
+    zone_count: int = 0      # occupancy estimate (total IN - total OUT) at the end of the interval
 
     def as_row(self) -> Tuple:
         return (self.camera_id, self.period_start, self.period_end, self.frames, self.current_count,
@@ -62,7 +62,7 @@ class _Interval:
 
 
 class CameraCounter:
-    def __init__(self, camera_id: str, tracker: PersonTracker, zone: Optional[ZoneCounter] = None) -> None:
+    def __init__(self, camera_id: str, tracker: PersonTracker, zone: Optional[LineCounter] = None) -> None:
         self.camera_id = camera_id
         self.tracker = tracker
         self.zone = zone
@@ -113,7 +113,7 @@ class CameraCounter:
         d = {"current": self.current, "total_persons": self.total_persons, "peak": self.peak,
              "tracks": self.tracker.active, "last_update": self.last_update}
         if self.zone is not None:
-            d.update({"in": self.zone.total_in, "out": self.zone.total_out, "in_zone": self.zone.inside_now})
+            d.update({"in": self.zone.total_in, "out": self.zone.total_out, "inside": self.zone.inside_now})
         return d
 
 
@@ -122,15 +122,19 @@ class PersonCounter:
 
     def __init__(self, camera_ids, interval_s: float = 60.0, track_iou: float = 0.3,
                  track_max_age_s: float = 2.0, track_min_hits: int = 2,
-                 zones: Optional[Dict[str, Sequence[Sequence[float]]]] = None, zone_anchor: str = "bottom",
-                 zone_min_frames: int = 2) -> None:
-        """zones: camera_id -> polygon [[x, y], ...] in frame pixels (cameras without one count no IN/OUT)."""
+                 lines: Optional[Dict[str, Sequence[float]]] = None, anchor: str = "bottom",
+                 min_frames: int = 2, min_distance: float = 4.0,
+                 in_directions: Optional[Dict[str, str]] = None) -> None:
+        """lines: camera_id -> [x1, y1, x2, y2] in frame pixels (cameras without one count no IN/OUT).
+        in_directions: camera_id -> down | up | right | left (the crossing that is IN; default down)."""
         self.interval_s = interval_s
         self._lock = threading.Lock()
-        zones = zones or {}
+        lines = lines or {}
+        dirs = in_directions or {}
         self.cameras: Dict[str, CameraCounter] = {
             cid: CameraCounter(cid, PersonTracker(track_iou, track_max_age_s, track_min_hits),
-                               ZoneCounter(cid, zones[cid], zone_anchor, zone_min_frames) if zones.get(cid) else None)
+                               LineCounter(cid, lines[cid], dirs.get(cid) or "down", anchor, min_frames, min_distance)
+                               if lines.get(cid) else None)
             for cid in camera_ids
         }
         self._last_flush = time.monotonic()
@@ -155,7 +159,7 @@ class PersonCounter:
         return seeded
 
     def in_out_totals(self) -> Dict[str, Tuple[int, int]]:
-        """Running IN / OUT totals of the cameras that have a count_zone."""
+        """Running IN / OUT totals of the cameras that have a count line."""
         with self._lock:
             return {cid: (c.zone.total_in, c.zone.total_out) for cid, c in self.cameras.items() if c.zone is not None}
 

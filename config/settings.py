@@ -71,11 +71,12 @@ class CameraConfig:
     latency_ms: int = 200
     transport: str = "tcp"       # tcp | udp
     priority: float = 1.0        # >1 = scheduled more aggressively
-    roi: Optional[List[int]] = None  # [x1, y1, x2, y2] in delivered resolution
+    # Person IN / OUT counting line: [x1, y1, x2, y2] = its two ends. Pixels in delivered resolution,
+    # or 0..1 fractions of width/height (stored as pixels). Also accepted as "x1,y1,x2,y2" text / JSON.
+    roi: Optional[List[float]] = None
+    in_direction: str = ""           # which crossing is IN: down | up | right | left ("" = FR_PERSON_IN_DIRECTION)
     tasks: List[str] = field(default_factory=lambda: [TASK_FACE])  # face | person | both
-    # Person IN/OUT region: polygon [[x, y], ...] (>= 3 points). Pixels in delivered resolution, or
-    # 0..1 fractions of width/height (what a frontend drawing tool usually gives). Stored as pixels.
-    count_zone: Optional[List[List[float]]] = None
+    gate_id: Optional[int] = None    # written to tbl_person_counts.gate_id (else the device's last known gate)
 
     @property
     def runs_face(self) -> bool:
@@ -108,27 +109,38 @@ class CameraConfig:
                              f"{list(CAMERA_TASKS)}, got {kwargs.get('tasks')!r}")
         kwargs["tasks"] = list(dict.fromkeys(tasks))
         cam = cls(**kwargs)
-        if cam.roi is not None and len(cam.roi) != 4:
-            raise ValueError(f"camera {cam.camera_id}: roi must be [x1, y1, x2, y2]")
-        if cam.count_zone is not None:
-            cam.count_zone = _parse_zone(cam.camera_id, cam.count_zone, cam.width, cam.height)
+        cam.roi = parse_line(cam.camera_id, cam.roi, cam.width, cam.height)
+        cam.in_direction = str(cam.in_direction or "").strip().lower()
+        if cam.in_direction and cam.in_direction not in ("down", "up", "right", "left"):
+            raise ValueError(f"camera {cam.camera_id}: in_direction must be down, up, right or left")
         return cam
 
 
-def _parse_zone(camera_id: str, zone: Any, width: int, height: int) -> Optional[List[List[float]]]:
-    if isinstance(zone, str):                     # JSON text, e.g. straight from a DB column
-        import json
-        zone = json.loads(zone)
-    if not zone:
+def parse_line(camera_id: str, value: Any, width: int, height: int) -> Optional[List[float]]:
+    """[x1, y1, x2, y2] (list, JSON text, or "x1,y1,x2,y2") -> pixels. None / empty = no line."""
+    if value is None:
         return None
+    if isinstance(value, str):
+        text = value.strip().strip("[]()")
+        if not text:
+            return None
+        value = text.replace(";", ",").split(",")
+    if isinstance(value, dict):                   # {"x1":..,"y1":..,"x2":..,"y2":..}
+        value = [value.get(k) for k in ("x1", "y1", "x2", "y2")]
     try:
-        pts = [[float(p[0]), float(p[1])] for p in zone]
-    except (TypeError, ValueError, IndexError):
-        raise ValueError(f"camera {camera_id}: count_zone must be a list of [x, y] points") from None
-    if len(pts) < 3:
-        raise ValueError(f"camera {camera_id}: count_zone needs at least 3 points, got {len(pts)}")
-    if all(0.0 <= v <= 1.0 for p in pts for v in p):   # normalised -> pixels
-        pts = [[x * width, y * height] for x, y in pts]
+        pts = [float(v) for v in value]
+    except (TypeError, ValueError):
+        raise ValueError(f"camera {camera_id}: roi must be [x1, y1, x2, y2], got {value!r}") from None
+    if not pts:
+        return None
+    if len(pts) != 4:
+        raise ValueError(f"camera {camera_id}: roi must be 4 numbers [x1, y1, x2, y2], got {len(pts)}")
+    if min(pts) < 0:
+        raise ValueError(f"camera {camera_id}: roi coordinates must be >= 0")
+    if all(v <= 1.0 for v in pts):                 # 0..1 fractions -> pixels
+        pts = [pts[0] * width, pts[1] * height, pts[2] * width, pts[3] * height]
+    if pts[0] == pts[2] and pts[1] == pts[3]:
+        raise ValueError(f"camera {camera_id}: roi line's two ends are the same point")
     return pts
 
 
@@ -163,10 +175,15 @@ class PersonSettings:
     track_max_age_s: float = 2.0     # tracker: drop a track not seen for this long
     track_min_hits: int = 2          # tracker: detections needed before a person is counted
     flush_interval_s: float = 60.0   # one count row per camera per interval is appended to the DB
-    zone_anchor: str = "bottom"      # point of the box tested against count_zone: bottom (feet) | center
-    zone_min_frames: int = 2         # frames a person must stay on the new side before IN/OUT counts
+    line_anchor: str = "bottom"      # point of the box that crosses the roi line: bottom (feet) | center
+    line_min_frames: int = 2         # frames a person must stay on the new side before IN/OUT counts
+    line_min_distance: float = 4.0   # px a person must be past the line (dead band against jitter)
+    in_direction: str = "down"       # crossing that is IN: down | up (horizontal line), right | left (vertical)
     init_sql: str = "SELECT * FROM public.fn_initialize_device_personcount()"  # starting totals ("" = start at 0)
     update_sql: str = "CALL sp_upsert_person_count_update(?, ?, ?, ?)"  # (device, in, out, time); "" = off
+    # Write IN / OUT straight into this table (one 'In' + one 'Out' row per device per business_date,
+    # updated in place). When set it replaces init_sql / update_sql. "" = use the SPs instead.
+    count_table: str = "tbl_person_counts"
 
 
 @dataclass
@@ -363,10 +380,13 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         track_max_age_s=_env("FR_PERSON_TRACK_MAX_AGE_S", 2.0),
         track_min_hits=_env("FR_PERSON_TRACK_MIN_HITS", 2),
         flush_interval_s=_env("FR_PERSON_FLUSH_S", 60.0),
-        zone_anchor=_env("FR_PERSON_ZONE_ANCHOR", "bottom"),
-        zone_min_frames=_env("FR_PERSON_ZONE_MIN_FRAMES", 2),
+        line_anchor=_env("FR_PERSON_LINE_ANCHOR", _env("FR_PERSON_ZONE_ANCHOR", "bottom")),
+        line_min_frames=_env("FR_PERSON_LINE_MIN_FRAMES", _env("FR_PERSON_ZONE_MIN_FRAMES", 2)),
+        line_min_distance=_env("FR_PERSON_LINE_MIN_DISTANCE", 4.0),
+        in_direction=_env("FR_PERSON_IN_DIRECTION", "down").lower(),
         init_sql=_env("FR_PERSON_INIT_SQL", PersonSettings.init_sql),
         update_sql=_env("FR_PERSON_UPDATE_SQL", PersonSettings.update_sql),
+        count_table=_env("FR_PERSON_COUNT_TABLE", PersonSettings.count_table),
     )
     d = DetectionSettings(
         det_threshold=_env("FR_DET_THRESHOLD", 0.5),
@@ -477,8 +497,10 @@ def _validate(s: Settings) -> None:
         raise ValueError("FR_API_PORT must be 1-65535")
     if s.camera_source.poll_s <= 0:
         raise ValueError("FR_CAMERA_POLL_S must be > 0")
-    if s.person.zone_anchor not in ("bottom", "center"):
-        raise ValueError("FR_PERSON_ZONE_ANCHOR must be bottom or center")
+    if s.person.line_anchor not in ("bottom", "center"):
+        raise ValueError("FR_PERSON_LINE_ANCHOR must be bottom or center")
+    if s.person.in_direction not in ("down", "up", "right", "left"):
+        raise ValueError("FR_PERSON_IN_DIRECTION must be down, up, right or left")
     if s.detection.batch_size < 1 or s.recognition.batch_size < 1 or s.person.batch_size < 1:
         raise ValueError("batch sizes must be >= 1")
     if s.storage.database_url and not s.storage.database_url.startswith(("postgres://", "postgresql://")):

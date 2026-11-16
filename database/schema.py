@@ -209,6 +209,8 @@ def _add_missing_columns(db: Database) -> None:
 
 def init_schema(db: Database) -> None:
     db.executescript(PG_SCHEMA_SQL if getattr(db, "backend", "sqlite") == "postgres" else SCHEMA_SQL)
+    if getattr(db, "backend", "sqlite") == "postgres":
+        db.executescript(OFFENDERS_PG_SQL)
     _add_missing_columns(db)
     row = db.fetchone("SELECT MAX(version) AS v FROM schema_version")
     current = row["v"] if row and row["v"] is not None else 0
@@ -216,3 +218,150 @@ def init_schema(db: Database) -> None:
         db.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?) "
                    "ON CONFLICT(version) DO NOTHING", (SCHEMA_VERSION, time.time()))
         log.info("Database schema at version %d (%s)", SCHEMA_VERSION, db.path)
+
+
+OFFENDERS_PG_SQL = """
+CREATE TABLE IF NOT EXISTS public.tbl_offenders (
+    offender_id   SERIAL PRIMARY KEY,
+    offender_name VARCHAR NOT NULL,
+    embedding     DOUBLE PRECISION[] NOT NULL,
+    loginid       INTEGER NOT NULL,
+    imagepath     TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by    INTEGER,
+    updated_by    INTEGER,
+    updated_date  TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS imagepath TEXT;
+ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS created_by INTEGER;
+ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS updated_by INTEGER;
+ALTER TABLE public.tbl_offenders ADD COLUMN IF NOT EXISTS updated_date TIMESTAMP WITHOUT TIME ZONE
+    NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS public.offender_sync (
+    person_id       BIGINT PRIMARY KEY REFERENCES public.persons(id) ON DELETE CASCADE,
+    offender_id     INTEGER NOT NULL UNIQUE,
+    synced_at       DOUBLE PRECISION NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.offender_embedding_sync (
+    person_id       BIGINT NOT NULL REFERENCES public.persons(id) ON DELETE CASCADE,
+    offender_id     INTEGER NOT NULL UNIQUE,
+    imagepath       TEXT NOT NULL,
+    synced_at       DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (person_id, imagepath)
+);
+
+CREATE TABLE IF NOT EXISTS public.offender_search_log (
+    logid                   SERIAL PRIMARY KEY,
+    camera_id               INTEGER NOT NULL,
+    capture_time            VARCHAR NOT NULL,
+    matched_offender_id     INTEGER,
+    matched_percentage      DOUBLE PRECISION NOT NULL,
+    matched_status          VARCHAR NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION public.fn_add_offenders(
+    p_offender_name CHARACTER VARYING,
+    p_embedding DOUBLE PRECISION[],
+    p_loginid INTEGER,
+    p_imagepath TEXT
+)
+RETURNS TABLE(p_message CHARACTER VARYING, new_offender_id INTEGER,
+              new_offender_name CHARACTER VARYING, new_loginid INTEGER)
+LANGUAGE plpgsql
+COST 100
+VOLATILE
+PARALLEL UNSAFE
+ROWS 1000
+AS $$
+BEGIN
+    INSERT INTO public.tbl_offenders
+        (offender_name, embedding, loginid, imagepath, is_active, created_by, updated_by, updated_date)
+    VALUES (p_offender_name, p_embedding, p_loginid, p_imagepath, TRUE, p_loginid, p_loginid, CURRENT_TIMESTAMP)
+    RETURNING offender_id INTO new_offender_id;
+
+    RETURN QUERY SELECT 'offender added'::character varying, new_offender_id,
+                        p_offender_name, p_loginid;
+END;
+$$;
+
+-- Keep the original three-argument API available for direct callers.
+CREATE OR REPLACE FUNCTION public.fn_add_offenders(
+    p_offender_name CHARACTER VARYING,
+    p_embedding DOUBLE PRECISION[],
+    p_loginid INTEGER
+)
+RETURNS TABLE(p_message CHARACTER VARYING, new_offender_id INTEGER,
+              new_offender_name CHARACTER VARYING, new_loginid INTEGER)
+LANGUAGE plpgsql
+COST 100
+VOLATILE
+PARALLEL UNSAFE
+ROWS 1000
+AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM public.fn_add_offenders(
+        p_offender_name, p_embedding, p_loginid, NULL::TEXT);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.fn_search_offender(
+    _camera_id INTEGER,
+    _input_embedding TEXT,
+    _capture_time CHARACTER VARYING
+)
+RETURNS TABLE(name CHARACTER VARYING, matched_offender_id INTEGER,
+              matched_percentage DOUBLE PRECISION, matched_status CHARACTER VARYING,
+              new_logid INTEGER)
+LANGUAGE plpgsql
+COST 100
+VOLATILE
+PARALLEL UNSAFE
+ROWS 1000
+AS $$
+DECLARE
+    v_embedding DOUBLE PRECISION[] := _input_embedding::DOUBLE PRECISION[];
+    v_name CHARACTER VARYING;
+    v_offender_id INTEGER;
+    v_loginid INTEGER;
+    v_similarity DOUBLE PRECISION;
+    v_status CHARACTER VARYING;
+    v_logid INTEGER;
+BEGIN
+    SELECT o.offender_name, o.offender_id, o.loginid, score.cosine_similarity
+      INTO v_name, v_offender_id, v_loginid, v_similarity
+      FROM public.tbl_offenders o
+      CROSS JOIN LATERAL (
+          SELECT SUM(q.value * o.embedding[q.ordinality::INTEGER]) /
+                 NULLIF(SQRT(SUM(q.value * q.value) * SUM(o.embedding[q.ordinality::INTEGER] *
+                       o.embedding[q.ordinality::INTEGER])), 0) AS cosine_similarity
+            FROM UNNEST(v_embedding) WITH ORDINALITY AS q(value, ordinality)
+           WHERE CARDINALITY(o.embedding) = CARDINALITY(v_embedding)
+      ) score
+     WHERE score.cosine_similarity IS NOT NULL
+       AND o.is_active = TRUE
+     ORDER BY score.cosine_similarity DESC
+     LIMIT 1;
+
+    v_status := CASE WHEN v_offender_id IS NOT NULL AND v_similarity >= 0.45
+                     THEN 'matched' ELSE 'not_matched' END;
+    IF v_status = 'not_matched' THEN
+        v_name := NULL;
+        v_offender_id := NULL;
+        v_loginid := NULL;
+    END IF;
+
+    INSERT INTO public.offender_search_log
+        (camera_id, capture_time, matched_offender_id, matched_percentage, matched_status)
+    VALUES (_camera_id, _capture_time, v_offender_id,
+            COALESCE(v_similarity, 0) * 100.0, v_status)
+    RETURNING logid INTO v_logid;
+
+    RETURN QUERY SELECT v_name, v_offender_id, COALESCE(v_similarity, 0) * 100.0,
+                        v_status, v_logid;
+END;
+$$;
+"""

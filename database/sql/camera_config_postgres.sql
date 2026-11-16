@@ -35,7 +35,8 @@ RETURNS TABLE (camera_id TEXT, name TEXT, location TEXT, url TEXT, tasks TEXT, c
 LANGUAGE sql STABLE AS $$
     SELECT c.camera_id, c.name, c.location, c.url,
            concat_ws(',', CASE WHEN c.run_face THEN 'face' END, CASE WHEN c.run_person THEN 'person' END),
-           c.count_zone::text, c.roi::text, c.fps, c.width, c.height, c.codec, c.enabled
+           c.count_zone::text, CASE WHEN c.run_person THEN c.roi::text END,
+           c.fps, c.width, c.height, c.codec, c.enabled
     FROM camera_config c
     WHERE c.enabled AND (c.run_face OR c.run_person)
     ORDER BY c.camera_id
@@ -51,7 +52,8 @@ RETURNS VOID LANGUAGE sql AS $$
     INSERT INTO camera_config AS c (camera_id, name, url, run_face, run_person, count_zone, location, enabled,
                                     fps, width, height, roi, codec, updated_at)
     VALUES (p_camera_id, p_name, p_url, p_run_face, p_run_person, p_count_zone, COALESCE(p_location, ''),
-            p_enabled, p_fps, p_width, p_height, p_roi, p_codec, now())
+            p_enabled, p_fps, p_width, p_height,
+            CASE WHEN p_run_person THEN p_roi ELSE NULL END, p_codec, now())
     ON CONFLICT (camera_id) DO UPDATE SET
         name = excluded.name, url = excluded.url, run_face = excluded.run_face, run_person = excluded.run_person,
         count_zone = excluded.count_zone, location = excluded.location, enabled = excluded.enabled,

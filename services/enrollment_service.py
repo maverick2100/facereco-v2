@@ -9,6 +9,7 @@ Use 3-10 clear, frontal-ish photos per person, ideally from the real cameras.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -25,6 +26,9 @@ from processing.face_quality import QualityConfig, assess_quality
 from utils.image_utils import load_image, resize_max
 
 log = logging.getLogger(__name__)
+
+# Change this one value when the offender service assigns real login IDs.
+OFFENDER_LOGIN_ID = 1
 
 
 @dataclass
@@ -91,11 +95,70 @@ class EnrollmentService:
         if crops:
             emb = self.inference.embed(crops)
             res.added = self.embeddings.add_many((pid, emb[i], meta[i][0], meta[i][1]) for i in range(len(crops)))
+            if res.added and getattr(self.embeddings.db, "backend", "sqlite") == "postgres":
+                self._sync_offender(pid, name, emb[0], meta[0][1], res, replace=replace)
         log.info("Enrolled %s (id=%s): +%d embeddings, %d skipped, %d errors",
                  name, pid, res.added, res.skipped, len(res.errors))
         for e in res.errors:
             log.warning("  %s: %s", name, e)
         return res
+
+    def _sync_offender(self, person_id: int, name: str, embedding: np.ndarray, imagepath: str,
+                       result: EnrollResult, replace: bool = False) -> None:
+        """Store each enrolled image's embedding as an offender row in PostgreSQL."""
+        db = self.embeddings.db
+        try:
+            mapping = db.fetchone(
+                "SELECT offender_id FROM public.offender_embedding_sync WHERE person_id = ? AND imagepath = ?",
+                (person_id, imagepath),
+            )
+            if mapping is None:
+                # Migrate/link rows created by the earlier one-vector-per-person implementation.
+                mapping = db.fetchone(
+                    "SELECT offender_id FROM public.tbl_offenders WHERE offender_name = ? AND imagepath = ? "
+                    "AND loginid = ? ORDER BY offender_id LIMIT 1",
+                    (name, imagepath, OFFENDER_LOGIN_ID),
+                )
+            if mapping is not None:
+                offender_id = int(mapping["offender_id"])
+                if replace:
+                    db.execute(
+                        "UPDATE public.tbl_offenders SET embedding = ?, is_active = TRUE, updated_by = ?, "
+                        "updated_date = CURRENT_TIMESTAMP WHERE offender_id = ?",
+                        (np.asarray(embedding, dtype=np.float64).reshape(-1).tolist(),
+                         OFFENDER_LOGIN_ID, offender_id),
+                    )
+                db.execute(
+                    "INSERT INTO public.offender_embedding_sync(person_id, offender_id, imagepath, synced_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT (person_id, imagepath) DO NOTHING",
+                    (person_id, offender_id, imagepath, time.time()),
+                )
+                return
+
+            row = db.fetchone(
+                "SELECT * FROM public.fn_add_offenders(?, ?, ?, ?)",
+                (name, np.asarray(embedding, dtype=np.float64).reshape(-1).tolist(),
+                 OFFENDER_LOGIN_ID, imagepath),
+            )
+            if row is None or row.get("new_offender_id") is None:
+                raise RuntimeError("fn_add_offenders returned no offender ID")
+            offender_id = int(row["new_offender_id"])
+            db.execute(
+                "INSERT INTO public.offender_embedding_sync(person_id, offender_id, imagepath, synced_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (person_id, imagepath) DO NOTHING",
+                (person_id, offender_id, imagepath, time.time()),
+            )
+            # Retain a primary mapping for older consumers; one person can now have many vectors.
+            db.execute(
+                "INSERT INTO public.offender_sync(person_id, offender_id, synced_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (person_id) DO NOTHING",
+                (person_id, offender_id, time.time()),
+            )
+            log.info("Synced offender embedding %s (person_id=%d, offender_id=%d, loginid=%d)",
+                     name, person_id, offender_id, OFFENDER_LOGIN_ID)
+        except Exception as exc:
+            result.errors.append(f"offender sync: {exc}")
+            log.exception("Could not sync offender %s (person_id=%d) to PostgreSQL", name, person_id)
 
     def enroll_directory(self, root: Path = ENROLLMENT_DIR, replace: bool = False) -> List[EnrollResult]:
         root = Path(root)

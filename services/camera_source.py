@@ -18,7 +18,6 @@ runs `NOTIFY camera_changed` (the trigger in database/sql/camera_config_postgres
 """
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -37,7 +36,9 @@ _ALIASES = {
     "rtsp_url": "url", "stream_url": "url", "rtsp": "url", "camera_url": "url",
     "use_case": "tasks", "usecase": "tasks", "use_cases": "tasks", "usecases": "tasks", "task": "tasks",
     "is_enabled": "enabled", "is_active": "enabled", "active": "enabled",
-    "zone": "count_zone", "region": "count_zone", "count_region": "count_zone",
+    "line": "roi", "count_line": "roi", "counting_line": "roi",
+    "direction": "in_direction", "count_direction": "in_direction",
+    "gateid": "gate_id", "gate": "gate_id",
 }
 _FACE_FLAGS = ("face", "run_face", "face_enabled", "is_face", "face_recognition")
 _PERSON_FLAGS = ("person", "run_person", "person_enabled", "is_person", "person_detection", "person_count")
@@ -74,6 +75,7 @@ def row_to_camera(row: Mapping[str, Any], defaults: Optional[Dict[str, Any]] = N
     """One SP row -> CameraConfig. Returns None for a disabled camera or one with no use case."""
     data: Dict[str, Any] = {}
     flags: Dict[str, bool] = {}
+    row_lc = {str(k).strip().lower(): v for k, v in row.items()}
     for key, value in row.items():
         k = str(key).strip().lower()
         if k in _FACE_FLAGS and value is not None:
@@ -85,14 +87,15 @@ def row_to_camera(row: Mapping[str, Any], defaults: Optional[Dict[str, Any]] = N
         k = _ALIASES.get(k, k)
         if k in _CAMERA_FIELDS and value is not None and k not in data:
             data[k] = value
+    ends = {k: row_lc[k] for k in ("x1", "y1", "x2", "y2") if row_lc.get(k) is not None}
+    if "roi" not in data and len(ends) == 4:          # line given as four columns x1, y1, x2, y2
+        data["roi"] = [ends["x1"], ends["y1"], ends["x2"], ends["y2"]]
     if "tasks" in data:
         data["tasks"] = parse_tasks(data["tasks"])
     elif flags:
         data["tasks"] = [t for t in (TASK_FACE, TASK_PERSON) if flags.get(t)]
     if "enabled" in data:
         data["enabled"] = _truthy(data["enabled"])
-    if isinstance(data.get("roi"), str):
-        data["roi"] = json.loads(data["roi"]) if data["roi"].strip() else None
     if "camera_id" in data:
         data["camera_id"] = str(data["camera_id"])
     if data.get("tasks") == [] or not data.get("enabled", True):
@@ -100,6 +103,9 @@ def row_to_camera(row: Mapping[str, Any], defaults: Optional[Dict[str, Any]] = N
     merged_defaults = dict(defaults or {})
     if "tasks" in data:
         merged_defaults.pop("tasks", None)
+    effective_tasks = data.get("tasks", parse_tasks(merged_defaults.get("tasks", [TASK_FACE])))
+    if TASK_PERSON not in effective_tasks:
+        data["roi"] = None
     return CameraConfig.from_dict(data, merged_defaults)
 
 

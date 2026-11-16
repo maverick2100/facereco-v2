@@ -67,9 +67,6 @@ from monitoring.performance import PerformanceTracker  # noqa: E402
 from monitoring.system_health import SystemHealth  # noqa: E402
 from person_detection.person_count_service import PersonCountService, load_yolo  # noqa: E402
 from recognition.duplicate_filter import DuplicateFilter, TrackCache  # noqa: E402
-from recognition.embedding_manager import EmbeddingGallery  # noqa: E402
-from recognition.face_matcher import FaceMatcher  # noqa: E402
-from recognition.identity_manager import IdentityManager  # noqa: E402
 from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
 from services.enrollment_service import EnrollmentService  # noqa: E402
 from services.event_service import EventService  # noqa: E402
@@ -102,9 +99,6 @@ class FaceRecognitionApp:
         self.person_count_repo = PersonCountRepository(self.db)
 
         self.inference = InferenceManager(settings.models, settings.detection, self.perf)
-        self.gallery = EmbeddingGallery()
-        self.identity = IdentityManager(self.person_repo, self.embedding_repo, self.gallery,
-                                        settings.recognition.gallery_reload_s)
         self.events = EventService(self.event_repo, settings.storage, self.perf)
         self.health_registry = CameraHealthRegistry()
         self.scheduler = FrameScheduler(max_frame_age_s=settings.detection.max_frame_age_s)
@@ -120,8 +114,9 @@ class FaceRecognitionApp:
         self.live: Optional[LiveView] = None
         if show is not None:
             shown = [c for c in self.cameras if not show or c.camera_id in show]
-            self.live = LiveView({c.camera_id: c.name for c in shown}, {c.camera_id: c.roi for c in shown},
-                                 zones={c.camera_id: c.count_zone for c in shown if c.runs_person})
+            self.live = LiveView({c.camera_id: c.name for c in shown},
+                                 lines={c.camera_id: (c.roi, c.in_direction or settings.person.in_direction)
+                                        for c in shown if c.runs_person and c.roi})
         self._stop = threading.Event()
 
     def _make_ingestion(self):
@@ -145,10 +140,9 @@ class FaceRecognitionApp:
         self.camera_repo.sync(self.cameras)
 
         if self.face_cameras:
+            if getattr(self.db, "backend", "sqlite") != "postgres":
+                raise RuntimeError("Database-only offender recognition requires PostgreSQL (FR_DATABASE_URL / FR_PG_*).")
             self.inference.load()
-            self.identity.reload()
-            if self.gallery.size == 0:
-                log.warning("Gallery is empty - every face will be 'unknown'. Run: python main.py enroll")
         if self.person_cameras:
             self.person_service = PersonCountService(
                 load_yolo(s.models, s.person), self.person_scheduler, self.person_count_repo,
@@ -167,13 +161,11 @@ class FaceRecognitionApp:
             self.receivers[cam.camera_id] = FrameReceiver(cam.camera_id, queues, h)
 
         if self.face_cameras:
-            matcher = FaceMatcher(self.gallery, s.recognition.match_threshold, s.recognition.match_margin)
             duplicates = DuplicateFilter(s.recognition.event_cooldown_s, s.recognition.unknown_cooldown_s,
                                          s.recognition.unknown_similarity)
             tracks = TrackCache(s.recognition.track_iou, s.recognition.track_reverify_s)
-            self.events.start()
             self.recognition = RecognitionService(
-                self.inference, self.scheduler, self.identity, matcher, duplicates, tracks, self.events,
+                self.inference, self.scheduler, None, None, duplicates, tracks, self.events,
                 self.face_cameras, s.detection, s.recognition, self.perf, s.storage.save_snapshots,
                 live=self.live,
             )
@@ -189,7 +181,7 @@ class FaceRecognitionApp:
             extra.update({
                 "scheduler": lambda: {k: v for k, v in self.scheduler.stats().items() if k != "per_camera"},
                 "pipeline": self.recognition.stats,
-                "gallery": lambda: {"persons": self.gallery.num_persons, "embeddings": self.gallery.size},
+                "gallery": lambda: {"source": "public.tbl_offenders"},
             })
         if self.person_service is not None:
             extra.update({
@@ -224,7 +216,7 @@ class FaceRecognitionApp:
         if self.person_service is not None:
             for cid, p in self.person_service.stats()["per_camera"].items():
                 if "in" in p and cid in st:
-                    st[cid] += f'  IN {p["in"]} OUT {p["out"]} inside {p["in_zone"]}'
+                    st[cid] += f'  IN {p["in"]} OUT {p["out"]} inside {p["inside"]}'
         return st
 
     def stop(self) -> None:
@@ -446,10 +438,10 @@ def cmd_cameras(settings: Settings, args) -> int:
     finally:
         src.close()
     print(f"source: {src.description}")
-    print(f"{'camera_id':<14} {'name':<22} {'face':<5} {'person':<7} {'zone':<5} url")
+    print(f"{'camera_id':<14} {'name':<22} {'face':<5} {'person':<7} {'line':<5} url")
     for c in cams:
         print(f"{c.camera_id:<14} {c.name[:22]:<22} {'yes' if c.runs_face else '-':<5} "
-              f"{'yes' if c.runs_person else '-':<7} {'yes' if c.count_zone else '-':<5} {mask_url(c.url)}")
+              f"{'yes' if c.runs_person else '-':<7} {'yes' if c.roi else '-':<5} {mask_url(c.url)}")
     print(f"{len(cams)} enabled cameras: face {sum(c.runs_face for c in cams)}, "
           f"person {sum(c.runs_person for c in cams)}")
     return 0

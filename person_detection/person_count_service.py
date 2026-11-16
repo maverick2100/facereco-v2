@@ -3,7 +3,9 @@
   FrameScheduler (person) --(batch)--> [person-detector thread]
       YOLOv7 (ANE) -> person filter / ROI -> tracker -> PersonCounter
       every FR_PERSON_FLUSH_S: one row per camera appended to `person_counts`
-      cameras with a `count_zone`: IN / OUT crossings -> `person_crossings` (batched every ~2 s)
+      cameras with a roi line [x1, y1, x2, y2]: IN / OUT crossings -> `person_crossings` (batched every ~2 s)
+      ...and the day's IN / OUT totals -> tbl_person_counts (one 'In' + one 'Out' row per device per
+      business_date, updated in place within ~2 s of a change; FR_PERSON_COUNT_TABLE)
 
 Runs alongside the face pipeline; both share the Neural Engine.
 """
@@ -12,12 +14,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Set
 
 from config.settings import CameraConfig, ModelSettings, PersonSettings
 from constants import MODEL_CACHE_DIR
 from services.live_view import LiveView
-from database.person_count_repository import PersonCountRepository
+from database.person_count_repository import (FLAG_IN, FLAG_OUT, DeviceCountTable, PersonCountRepository,
+                                               device_key)
 from inference.coreml_loader import CoreMLModel
 from monitoring.performance import PerformanceTracker
 from person_detection.person_counter import CountRecord, PersonCounter
@@ -41,7 +45,7 @@ class PersonCountService:
     def __init__(self, engine: YOLOv7Engine, frames: FrameScheduler, repo: PersonCountRepository,
                  cameras: List[CameraConfig], settings: PersonSettings,
                  perf: Optional[PerformanceTracker] = None, retention_days: int = 0,
-                 live: Optional[LiveView] = None) -> None:
+                 live: Optional[LiveView] = None, table: Optional[DeviceCountTable] = None) -> None:
         self.engine = engine
         self.frames = frames
         self.repo = repo
@@ -53,10 +57,20 @@ class PersonCountService:
         self._last_retention = 0.0
         self.counter = PersonCounter(self.cameras, settings.flush_interval_s, settings.track_iou,
                                      settings.track_max_age_s, settings.track_min_hits,
-                                     zones={c.camera_id: c.count_zone for c in cameras if c.count_zone},
-                                     zone_anchor=settings.zone_anchor, zone_min_frames=settings.zone_min_frames)
+                                     lines={c.camera_id: c.roi for c in cameras if c.roi},
+                                     anchor=settings.line_anchor, min_frames=settings.line_min_frames,
+                                     min_distance=settings.line_min_distance,
+                                     in_directions={c.camera_id: c.in_direction or settings.in_direction
+                                                    for c in cameras})
         self._last_crossing_write = 0.0
-        self._pushed: Dict[str, tuple] = {}   # camera_id -> (in, out) last sent to the update SP
+        self._pushed: Dict[str, tuple] = {}   # camera_id -> (in, out) last sent to the update SP / table
+        name = (settings.count_table or "").strip()
+        if table is None and name.lower() not in ("", "off", "none", "-") and getattr(repo, "db", None) is not None:
+            table = DeviceCountTable(repo.db, name)
+        self.table = table                    # set -> write tbl_person_counts directly (instead of the SPs)
+        self._day = date.today()              # business_date of the running totals
+        self._has_rows: Set[str] = set()      # cameras that already have today's In / Out rows
+        self._gates: Dict[str, Optional[int]] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -73,6 +87,9 @@ class PersonCountService:
 
     def load_initial_totals(self) -> None:
         """Step 1: get each device's total so far (FR_PERSON_INIT_SQL) and count on from there."""
+        if self.table is not None:
+            self._load_day_totals()
+            return
         sql = (self.settings.init_sql or "").strip()
         if not sql:
             return
@@ -89,6 +106,20 @@ class PersonCountService:
         if missing:
             log.warning("No starting totals for camera(s) %s (SP returned ids: %s) - those start at 0",
                         ", ".join(missing), ", ".join(sorted(totals)) or "none")
+
+    def _load_day_totals(self) -> None:
+        """Continue from today's In / Out rows in tbl_person_counts (cameras without rows start at 0)."""
+        self._day = date.today()
+        try:
+            totals = self.table.day_totals(self._day)
+        except Exception as exc:
+            log.warning("Reading today's totals from %s failed (%s) - counting starts at 0", self.table.table, exc)
+            return
+        seeded = self.counter.seed_totals(totals)
+        self._has_rows = set(seeded)
+        self._pushed.update(self.counter.in_out_totals())
+        for cid in seeded:
+            log.info("Camera %s: today's totals so far %s (%s)", cid, totals[cid], self.table.table)
 
     def start(self) -> None:
         self.load_initial_totals()
@@ -131,8 +162,7 @@ class PersonCountService:
             self.perf.add_busy("yolo", dt)
             self.perf.incr("person_frames_processed", len(frames))
             for frame, dets in zip(frames, results):
-                cam = self.cameras.get(frame.camera_id)
-                dets = filter_persons(dets, self.settings.min_box_height, cam.roi if cam else None)
+                dets = filter_persons(dets, self.settings.min_box_height)   # roi is the count line, not a crop
                 self.perf.incr("persons_detected", int(dets.shape[0]))
                 new = self.counter.update(frame.camera_id, dets, frame.timestamp, frame.mono_ts)
                 if new:
@@ -157,7 +187,10 @@ class PersonCountService:
             log.exception("Failed to write %d zone crossings", len(rows))
 
     def _push_totals(self) -> None:
-        """Step 2: send each camera's changed IN / OUT totals to the update SP (FR_PERSON_UPDATE_SQL)."""
+        """Step 2: send each camera's changed IN / OUT totals to tbl_person_counts or the update SP."""
+        if self.table is not None:
+            self._push_table()
+            return
         sql = (self.settings.update_sql or "").strip()
         if not sql:
             return
@@ -172,6 +205,45 @@ class PersonCountService:
                 self._pushed[cid] = (n_in, n_out)
             except Exception:
                 log.exception("Count update failed for camera %s (in=%d out=%d) - retrying", cid, n_in, n_out)
+
+    def _push_table(self) -> None:
+        today = date.today()
+        if today != self._day:              # new business_date: totals restart at 0
+            log.info("New business date %s - IN / OUT totals reset", today)
+            self.counter.seed_totals({cid: {"in": 0, "out": 0} for cid in self.cameras})
+            self._pushed = dict(self.counter.in_out_totals())
+            self._has_rows.clear()
+            self._day = today
+        totals = self.counter.in_out_totals()
+        changed = {cid: v for cid, v in totals.items() if self._pushed.get(cid, (0, 0)) != v}
+        if not changed:
+            return
+        now = datetime.now().replace(microsecond=0)
+        for cid, (n_in, n_out) in changed.items():
+            old_in, old_out = self._pushed.get(cid, (0, 0))
+            device = device_key(cid)
+            try:
+                gate = self._gate(cid, device)
+                for flag, new, old in ((FLAG_IN, n_in, old_in), (FLAG_OUT, n_out, old_out)):
+                    if new != old or cid not in self._has_rows:   # first write of the day: both rows
+                        self.table.upsert(device, gate, flag, new, max(0, new - old), now, today)
+                self._pushed[cid] = (n_in, n_out)
+                self._has_rows.add(cid)
+            except Exception:
+                log.exception("Writing %s failed for camera %s (in=%d out=%d) - retrying",
+                              self.table.table, cid, n_in, n_out)
+
+    def _gate(self, cid: str, device: Any) -> Optional[int]:
+        """gate_id from the camera config, else the gate this device was last stored with."""
+        cam = self.cameras.get(cid)
+        if cam is not None and cam.gate_id not in (None, ""):
+            return int(cam.gate_id) if str(cam.gate_id).isdigit() else cam.gate_id
+        if cid not in self._gates:
+            self._gates[cid] = self.table.last_gate(device)
+            if self._gates[cid] is None:
+                log.warning("Camera %s: no gate_id (not in the camera config, none in %s) - gate_id left empty",
+                            cid, self.table.table)
+        return self._gates[cid]
 
     def _write(self, records: List[CountRecord]) -> None:
         if not records:
