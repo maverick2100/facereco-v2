@@ -6,7 +6,7 @@ import time
 
 from constants import SCHEMA_VERSION
 from database.connection import Database
-from database.offender_repository import offender_table_sql
+from database.offender_repository import offender_search_log_table_sql, offender_table_sql
 
 log = logging.getLogger(__name__)
 
@@ -211,7 +211,9 @@ def _add_missing_columns(db: Database) -> None:
 def init_schema(db: Database) -> None:
     db.executescript(PG_SCHEMA_SQL if getattr(db, "backend", "sqlite") == "postgres" else SCHEMA_SQL)
     if getattr(db, "backend", "sqlite") == "postgres":
-        db.executescript(OFFENDERS_PG_SQL.replace("__OFFENDER_TABLE__", offender_table_sql()))
+        sql = OFFENDERS_PG_SQL.replace("__OFFENDER_TABLE__", offender_table_sql())
+        sql = sql.replace("__OFFENDER_SEARCH_LOG_TABLE__", offender_search_log_table_sql())
+        db.executescript(sql)
     _add_missing_columns(db)
     row = db.fetchone("SELECT MAX(version) AS v FROM schema_version")
     current = row["v"] if row and row["v"] is not None else 0
@@ -255,7 +257,7 @@ CREATE TABLE IF NOT EXISTS public.offender_embedding_sync (
     PRIMARY KEY (person_id, imagepath)
 );
 
-CREATE TABLE IF NOT EXISTS public.offender_search_log (
+CREATE TABLE IF NOT EXISTS __OFFENDER_SEARCH_LOG_TABLE__ (
     logid                   SERIAL PRIMARY KEY,
     camera_id               INTEGER NOT NULL,
     capture_time            VARCHAR NOT NULL,
@@ -355,7 +357,7 @@ BEGIN
         v_loginid := NULL;
     END IF;
 
-    INSERT INTO public.offender_search_log
+    INSERT INTO __OFFENDER_SEARCH_LOG_TABLE__
         (camera_id, capture_time, matched_offender_id, matched_percentage, matched_status)
     VALUES (_camera_id, _capture_time, v_offender_id,
             COALESCE(v_similarity, 0) * 100.0, v_status)

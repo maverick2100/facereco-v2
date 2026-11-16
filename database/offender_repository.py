@@ -14,15 +14,24 @@ from database.connection import Database
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
 
-def offender_table_sql() -> str:
-    """Return a safely quoted FR_OFFENDER_TABLE name (schema.table; default public.tbl_offenders)."""
-    raw = os.getenv("FR_OFFENDER_TABLE", "public.tbl_offenders").strip()
+def _configured_table_sql(env_name: str, default: str) -> str:
+    raw = os.getenv(env_name, default).strip()
     parts = raw.split(".")
     if len(parts) == 1:
         parts.insert(0, "public")
     if len(parts) != 2 or any(not _IDENTIFIER.fullmatch(part) for part in parts):
-        raise ValueError("FR_OFFENDER_TABLE must be a table name or schema.table using SQL identifiers")
+        raise ValueError(f"{env_name} must be a table name or schema.table using SQL identifiers")
     return ".".join('"' + part.replace('"', '""') + '"' for part in parts)
+
+
+def offender_table_sql() -> str:
+    """Return the configured offender embeddings table (default public.tbl_offenders)."""
+    return _configured_table_sql("FR_OFFENDER_TABLE", "public.tbl_offenders")
+
+
+def offender_search_log_table_sql() -> str:
+    """Return the configured offender search log table (default public.offender_search_log)."""
+    return _configured_table_sql("FR_OFFENDER_SEARCH_LOG_TABLE", "public.offender_search_log")
 
 
 class OffenderRepository:
