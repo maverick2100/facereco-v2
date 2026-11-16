@@ -120,3 +120,14 @@ def test_file_sources_use_a_non_leaky_queue():
     live = build_pipeline_description(CameraConfig.from_dict({"camera_id": "l", "url": "rtsp://h/s"}))
     assert "leaky" not in f and "sync=true" in f          # files: paced by back-pressure, real time
     assert "leaky=downstream" in live and "sync=false" in live
+
+
+def test_explain_error_points_at_codec():
+    from ingestion.camera_pipeline import explain_error
+
+    dbg = "../gst/rtsp/gstrtspsrc.c(3266): gst_rtspsrc_loop (): streaming stopped, reason not-linked (-1)"
+    msg = explain_error("Internal data stream error.", dbg, "h264")
+    assert "reason: not-linked" in msg and "codec: h265 or codec: auto" in msg
+    assert "codec: h264 or codec: auto" in explain_error("Internal data stream error.", dbg, "h265")
+    assert explain_error("Could not open resource for reading.", None) == "Could not open resource for reading."
+    assert explain_error("x", "streaming stopped, reason error (-5)") == "x (reason: error)"

@@ -267,6 +267,12 @@ Moving to the database later:  python scripts/migrate_sqlite_to_postgres.py
   API: "The API needs PostgreSQL"           set FR_PG_* or FR_DATABASE_URL
   401 from the API                          send header X-API-Key
   Browser dashboard blocked (CORS)          add its origin to FR_API_CORS_ORIGINS
+  "Internal data stream error"              camera sends H.265 but codec is h264 (the default):
+   (reason: not-linked / not-negotiated)      set codec: h265 or codec: auto for that camera
+                                            (cameras.yaml, or "codec" in the API / SP).
+                                            Test first: python scripts/test_gstreamer.py
+                                                        --url rtsp://... --codec h265
+  "Could not open resource"                 wrong IP / port / path, or camera offline
   Camera never streams                      test the URL in VLC; try codec: h265 or auto
 
 Stop facereco: Ctrl+C (or q in the --show window). Counts are saved before it exits.

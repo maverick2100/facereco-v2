@@ -4,6 +4,7 @@
     python scripts/test_gstreamer.py                       # all enabled cameras, 20 s
     python scripts/test_gstreamer.py --cameras cam01,cam02 --seconds 30
     python scripts/test_gstreamer.py --url test://ball     # synthetic source
+    python scripts/test_gstreamer.py --url rtsp://user:pass@ip/stream --codec auto   # h264 | h265 | auto
     python scripts/test_gstreamer.py --cameras cam01 --save-frame /tmp/cam01.jpg
 """
 import argparse
@@ -29,6 +30,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cameras", help="comma-separated camera ids")
     ap.add_argument("--url", help="ad-hoc url (rtsp://, file://, test://)")
+    ap.add_argument("--codec", choices=["h264", "h265", "auto"],
+                    help="override the codec (for --url, and for --cameras instead of cameras.yaml)")
     ap.add_argument("--seconds", type=float, default=20)
     ap.add_argument("--save-frame", help="save the last frame of the first camera to this path")
     args = ap.parse_args()
@@ -44,7 +47,8 @@ def main() -> int:
     print("missing elements:", ", ".join(missing) if missing else "none")
 
     if args.url:
-        cams = [CameraConfig(camera_id="adhoc", name="adhoc", url=args.url)]
+        # same defaults as cameras.yaml (codec, size, fps...), so the test matches a real run
+        cams = [CameraConfig.from_dict({"camera_id": "adhoc", "url": args.url}, settings.camera_source.defaults)]
     else:
         cams = settings.enabled_cameras
         if args.cameras:
@@ -53,6 +57,9 @@ def main() -> int:
     if not cams:
         print("no cameras selected")
         return 1
+    if args.codec:
+        for c in cams:
+            c.codec = args.codec
     print("pipeline example:", build_pipeline_description(cams[0]).replace(cams[0].url, mask_url(cams[0].url)))
 
     sched = FrameScheduler(max_frame_age_s=1e9)

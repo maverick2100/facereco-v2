@@ -10,6 +10,7 @@ and handed to Python, which keeps CPU usage low.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from fractions import Fraction
 from typing import Any, Callable, Optional
@@ -52,6 +53,28 @@ def _quote_credentials(url: str) -> str:
 def mask_url(url: str) -> str:
     scheme, creds, host = _split_credentials(url)
     return url if creds is None else f"{scheme}://***@{host}"
+
+
+_REASON = re.compile(r"reason ([a-z-]+)")
+
+
+def explain_error(message: str, debug: Optional[str], codec: str = "h264") -> str:
+    """GStreamer's message plus the reason buried in its debug text, and what to do about it.
+
+    "Internal data stream error." alone says nothing; the debug string says e.g.
+    "streaming stopped, reason not-linked (-1)", which on an RTSP camera almost always means
+    the stream's codec isn't the one the pipeline was built for.
+    """
+    m = _REASON.search(debug or "")
+    if not m:
+        return message
+    reason = m.group(1)
+    out = f"{message} (reason: {reason})"
+    if reason in ("not-linked", "not-negotiated"):
+        other = "h265" if codec.lower() == "h264" else "h264"
+        out += (f" - the camera's video codec probably isn't {codec}: set codec: {other} or codec: auto "
+                f"for this camera")
+    return out
 
 
 def build_pipeline_description(cam: CameraConfig) -> str:
@@ -158,10 +181,11 @@ class GstCameraPipeline:
         t = msg.type
         if t == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
-            log.warning("[%s] GStreamer error: %s", self.camera.camera_id, err.message)
+            detail = explain_error(err.message, dbg, self.camera.codec)
+            log.warning("[%s] GStreamer error: %s", self.camera.camera_id, detail)
             log.debug("[%s] debug: %s", self.camera.camera_id, dbg)
-            self.health.on_error(err.message)
-            self.schedule_restart(err.message)
+            self.health.on_error(detail)
+            self.schedule_restart(detail)
         elif t == Gst.MessageType.EOS:
             log.info("[%s] end of stream", self.camera.camera_id)
             self.schedule_restart("eos")
