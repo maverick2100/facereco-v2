@@ -2,7 +2,7 @@
 --
 --   psql "$FR_DATABASE_URL" -f database/sql/dashboard_postgres.sql
 --
--- Run it after facereco has started once (it creates person_crossings / person_counts / cameras).
+-- The tables it reads (person_crossings / person_counts / cameras) must already exist.
 -- Safe to run again (CREATE OR REPLACE).
 --
 -- Common parameters:
@@ -10,7 +10,7 @@
 --   p_cameras  only these camera ids, e.g. ARRAY['gate1','gate2'] (NULL = all cameras)
 --   p_tz       time zone for days and hours (the app stores UTC epoch seconds)
 --
--- IN / OUT only exist for cameras with a count_zone. Live numbers come from person_crossings
+-- IN / OUT only exist for cameras with a roi line. Live numbers come from person_crossings
 -- (~2 s behind); unique people and peaks come from person_counts (written every FR_PERSON_FLUSH_S).
 
 -- 1. Hourly IN / OUT for one day: always 24 rows (00:00 .. 23:00), zeros included.
@@ -68,7 +68,7 @@ $$;
 -- 3. Summary tiles for one day (one row).
 --    SELECT * FROM sp_dash_summary();
 --    inside_now      = IN - OUT since midnight (never below 0): people inside the counted area
---    in_zone_now     = people standing inside the drawn zones right now (latest interval per camera)
+--    in_zone_now     = IN - OUT occupancy estimate at the latest interval per camera
 --    cameras_live    = cameras that reported in the last 3 minutes
 CREATE OR REPLACE FUNCTION sp_dash_summary(
     p_day DATE DEFAULT NULL, p_cameras TEXT[] DEFAULT NULL, p_tz TEXT DEFAULT 'Asia/Kolkata')

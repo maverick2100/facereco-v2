@@ -3,9 +3,9 @@
 With FR_CAMERA_SOURCE=db the service runs FR_CAMERA_SQL (default `SELECT * FROM sp_get_cameras()`).
 Each row returned is one camera, and its columns say which use case runs on it:
 
-    camera_id | name  | url            | tasks          | enabled | count_zone          | fps ...
+    camera_id | name  | url            | tasks          | enabled | roi                 | fps ...
     cam01     | Gate  | rtsp://...     | face           | true    |                     |
-    cam02     | Hall  | rtsp://...     | person         | true    | [[0.5,0],[1,0],...] |
+    cam02     | Hall  | rtsp://...     | person         | true    | [0.5, 0, 0.5, 1]    |
     cam03     | Lobby | rtsp://...     | face,person    | true    |                     |
 
 `tasks` may be text ("face", "person", "face,person", "both"), a text[] array, or replaced by two

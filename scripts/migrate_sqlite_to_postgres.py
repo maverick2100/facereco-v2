@@ -5,7 +5,7 @@
     python scripts/migrate_sqlite_to_postgres.py --sqlite other.db
     python scripts/migrate_sqlite_to_postgres.py --truncate         # empty the PostgreSQL tables first
 
-Row ids are kept, so events stay linked to their persons; the id sequences are moved past the
+Row ids are kept; the id sequences are moved past the
 copied rows afterwards. Run it while the system is stopped.
 """
 import argparse
@@ -16,11 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import load_settings  # noqa: E402
 from database.connection import Database, PostgresDatabase, open_database  # noqa: E402
-from database.schema import init_schema  # noqa: E402
 
 # Parent tables first (foreign keys).
-TABLES = ["cameras", "persons", "embeddings", "events", "person_counts", "person_crossings"]
-SERIAL_TABLES = ["persons", "embeddings", "events", "person_counts", "person_crossings"]
+TABLES = ["cameras", "persons", "person_counts", "person_crossings"]
+SERIAL_TABLES = ["persons", "person_counts", "person_crossings"]
 CHUNK = 2000
 
 
@@ -40,10 +39,8 @@ def main() -> int:
         return 1
 
     src = Database(src_path)
-    init_schema(src)  # an older SQLite file gets the newer tables/columns (empty) first
     dst = open_database(settings.storage)
     assert isinstance(dst, PostgresDatabase)
-    init_schema(dst)
 
     if args.truncate:
         dst.execute("TRUNCATE " + ", ".join(TABLES) + " RESTART IDENTITY CASCADE")

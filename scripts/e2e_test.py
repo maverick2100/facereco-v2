@@ -5,9 +5,9 @@ It adds two temporary cameras through the SPs, runs the real `main.py run` super
 checks every step by looking at the database:
 
   1. database connection + SPs present
-  2. SP says: e2e_face = face, e2e_person = person (with an IN/OUT zone)
+  2. SP says: e2e_face = face, e2e_person = person (with an IN/OUT line)
      -> pipelines start automatically
-     -> face events, person_counts rows, IN and OUT crossings reach the DB
+     -> person_counts rows, IN and OUT crossings reach the DB
   3. SP change: e2e_face switched to person  -> NOTIFY -> restarted within seconds, counts arrive
   4. SP change: e2e_person disabled          -> stops running
   5. clean-up: the e2e cameras are deleted (results too, unless --keep)
@@ -37,13 +37,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 FACE, PERSON = "e2e_face", "e2e_person"
-ZONE = "[[0.5,0],[1,0],[1,1],[0.5,1]]"          # right half of the frame
+LINE = "[0.5, 0, 0.5, 1]"                     # vertical line down the middle
 
 
 # --------------------------------------------------------------------------- fake models
 def install_fake_models() -> None:
     """Replace Core ML loading with in-process fakes: one face at a fixed spot, one person walking
-    left <-> right across the frame (so it crosses the zone edge: IN, then OUT, every 6 s)."""
+    left <-> right across the frame (so it crosses the line: IN, then OUT, every 6 s)."""
     import numpy as np
 
     import inference.inference_manager as im
@@ -131,7 +131,6 @@ def main() -> int:
     import main as app_main
     from config.settings import load_settings
     from database.connection import open_database
-    from database.schema import init_schema
     from services.camera_source import CameraSource
 
     settings = load_settings()
@@ -149,7 +148,6 @@ def main() -> int:
         return 1
     try:
         db = open_database(settings.storage)
-        init_schema(db)
     except Exception as exc:
         rep.ok(False, "connect", str(exc))
         return 1
@@ -163,9 +161,10 @@ def main() -> int:
                   "" if have_sp >= 3 else "run with --apply-sql, or create them"):
         return 1
 
-    def upsert(cid, url, face, person, zone=None, enabled=True):
-        db.execute("SELECT sp_upsert_camera(?, ?, ?, ?, ?, ?::jsonb, 'e2e', ?)",
-                   (cid, cid, url, face, person, zone, enabled))
+    def upsert(cid, url, face, person, line=None, enabled=True):
+        db.execute("SELECT sp_upsert_camera(p_camera_id => ?, p_name => ?, p_url => ?, p_run_face => ?, "
+                   "p_run_person => ?, p_location => 'e2e', p_enabled => ?, p_roi => ?::jsonb)",
+                   (cid, cid, url, face, person, enabled, line))
 
     def rows(table, cid, since, extra=""):
         return db.fetchone(f"SELECT COUNT(*) AS n FROM {table} WHERE camera_id = ? AND ts >= ?{extra}",
@@ -191,20 +190,15 @@ def main() -> int:
             t0, since = time.monotonic(), time.time()
             print("\n2. SP -> use cases start automatically")
             if args.skip_face:
-                upsert(PERSON, args.person_url, False, True, ZONE)
+                upsert(PERSON, args.person_url, False, True, LINE)
                 rep.ok(wait_for(lambda: started_with({PERSON: ("person",)}, t0), args.timeout),
                        "supervisor started e2e_person=person from sp_get_cameras()")
             else:
                 upsert(FACE, args.face_url, True, False)
-                upsert(PERSON, args.person_url, False, True, ZONE)
+                upsert(PERSON, args.person_url, False, True, LINE)
                 rep.ok(wait_for(lambda: started_with({FACE: ("face",), PERSON: ("person",)}, t0), args.timeout),
                        "supervisor started e2e_face=face, e2e_person=person from sp_get_cameras()")
             if detections_checked:
-                if args.skip_face:
-                    rep.add("SKIP", "face events", "--skip-face")
-                else:
-                    rep.ok(wait_for(lambda: rows("events", FACE, since), args.timeout) > 0,
-                           "face events written (events table)")
                 rep.ok(wait_for(lambda: rows("person_counts", PERSON, since), args.timeout) > 0,
                        "person_counts rows written")
                 rep.ok(wait_for(lambda: rows("person_crossings", PERSON, since, " AND direction = 'in'"),
@@ -217,13 +211,13 @@ def main() -> int:
             else:
                 rep.ok(wait_for(lambda: rows("person_counts", PERSON, since), args.timeout) > 0,
                        "person_counts rows written (frames flowing)")
-                rep.add("SKIP", "face events / IN-OUT crossings",
+                rep.add("SKIP", "IN-OUT crossings",
                         "test video has no faces or people: use --fake-models, or --face-url/--person-url")
 
             t1, since = time.monotonic(), time.time()
             if args.skip_face:
                 print("\n3. SP change: new camera e2e_face added (person)")
-                upsert(FACE, args.person_url, False, True, ZONE)
+                upsert(FACE, args.person_url, False, True, LINE)
             else:
                 print("\n3. SP change: e2e_face switched face -> person")
                 upsert(FACE, args.face_url, False, True)
@@ -237,7 +231,7 @@ def main() -> int:
 
             print("\n4. SP change: e2e_person disabled")
             t2 = time.monotonic()
-            upsert(PERSON, args.person_url, False, True, ZONE, enabled=False)
+            upsert(PERSON, args.person_url, False, True, LINE, enabled=False)
             rep.ok(wait_for(lambda: started_with({FACE: ("person",)}, t2), args.timeout),
                    "e2e_person no longer running")
             print(f"\n   total scenario time {time.monotonic() - t0:.0f}s")
@@ -255,7 +249,7 @@ def main() -> int:
         for cid in (FACE, PERSON):
             db.execute("SELECT sp_delete_camera(?)", (cid,))
         if not args.keep:
-            for table in ("events", "person_counts", "person_crossings"):
+            for table in ("person_counts", "person_crossings"):
                 db.execute(f"DELETE FROM {table} WHERE camera_id IN (?, ?)", (FACE, PERSON))
             db.execute("DELETE FROM cameras WHERE id IN (?, ?)", (FACE, PERSON))
         rep.ok(db.fetchone("SELECT COUNT(*) AS n FROM camera_config WHERE camera_id IN (?, ?)",

@@ -22,11 +22,6 @@ import numpy as np  # noqa: E402
 cv2.setNumThreads(1)
 
 from config.settings import CameraConfig, load_settings  # noqa: E402
-from database.connection import Database  # noqa: E402
-from database.embedding_repository import EmbeddingRepository  # noqa: E402
-from database.event_repository import EventRepository  # noqa: E402
-from database.person_repository import PersonRepository  # noqa: E402
-from database.schema import init_schema  # noqa: E402
 from ingestion.camera_health import CameraHealthRegistry  # noqa: E402
 from ingestion.frame_receiver import FrameReceiver  # noqa: E402
 from inference.inference_manager import InferenceManager  # noqa: E402
@@ -36,11 +31,23 @@ from monitoring.performance import PerformanceTracker  # noqa: E402
 from recognition.duplicate_filter import DuplicateFilter, TrackCache  # noqa: E402
 from recognition.embedding_manager import EmbeddingGallery  # noqa: E402
 from recognition.face_matcher import FaceMatcher  # noqa: E402
-from recognition.identity_manager import IdentityManager  # noqa: E402
 from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
-from services.event_service import EventService  # noqa: E402
 from services.recognition_service import RecognitionService  # noqa: E402
 from utils.logger import setup_logging  # noqa: E402
+
+
+class _LocalOffenders:
+    """In-process stand-in for the tbl_offenders search, so the benchmark measures the models, not PostgreSQL."""
+
+    def __init__(self, matcher: FaceMatcher) -> None:
+        self.matcher = matcher
+
+    def search(self, embedding):
+        r = self.matcher.match(embedding)
+        return {"offender_id": r.person_id, "offender_name": f"person-{r.person_id}", "similarity": r.similarity}
+
+    def log_search(self, **row):
+        return None
 
 
 def load_frames(args, size):
@@ -81,16 +88,14 @@ def main() -> int:
     settings = load_settings()
     setup_logging(settings.logging_config, "WARNING")
     perf = PerformanceTracker()
-    db = Database(":memory:")
-    init_schema(db)
-    persons, embeddings, events_repo = PersonRepository(db), EmbeddingRepository(db), EventRepository(db)
 
     inference = InferenceManager(settings.models, settings.detection, perf).load()
     gallery = EmbeddingGallery()
     # Fake gallery of 500 people so matching cost is realistic.
     rng = np.random.default_rng(0)
     gallery.replace(np.repeat(np.arange(1, 501), 5), rng.standard_normal((2500, 512)).astype(np.float32))
-    identity = IdentityManager(persons, embeddings, gallery, reload_interval_s=1e9)
+    offenders = _LocalOffenders(FaceMatcher(gallery, settings.recognition.match_threshold,
+                                            settings.recognition.match_margin))
 
     cams = [CameraConfig(camera_id=f"sim{i:02d}", name=f"sim{i:02d}", url="test://", fps=args.fps,
                          width=args.width, height=args.height) for i in range(args.cameras)]
@@ -101,11 +106,10 @@ def main() -> int:
     rc = settings.recognition
     if args.no_track_cache:
         rc.track_reverify_s = 0
-    events = EventService(events_repo, settings.storage, perf)
     svc = RecognitionService(
-        inference, sched, identity, FaceMatcher(gallery, rc.match_threshold, rc.match_margin),
+        inference, sched, offenders,
         DuplicateFilter(rc.event_cooldown_s, rc.unknown_cooldown_s, rc.unknown_similarity),
-        TrackCache(rc.track_iou, rc.track_reverify_s), events, cams, settings.detection, rc, perf,
+        TrackCache(rc.track_iou, rc.track_reverify_s), cams, settings.detection, rc, perf,
     )
     frames = load_frames(args, (args.width, args.height))
     stop = threading.Event()
@@ -126,7 +130,6 @@ def main() -> int:
             tick += 1
 
     cpu, mem = CPUMonitor(), MemoryMonitor()
-    events.start()
     svc.start()
     threading.Thread(target=feeder, daemon=True).start()
     print(f"running {args.cameras} cams x {args.fps} fps for {args.seconds:.0f}s ...")
@@ -145,7 +148,6 @@ def main() -> int:
               f"busy {perf.utilization('inference') * 100:5.1f}%  CPU {s['process_pct_of_core']:5.1f}% of 1 core")
     stop.set()
     svc.stop()
-    events.stop()
 
     snap = perf.snapshot()
     offered = args.cameras * args.fps

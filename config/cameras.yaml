@@ -13,12 +13,13 @@
 #    tasks: [person]         person detection + counting (YOLOv7) -> person_counts table
 #    tasks: [face, person]   both
 #
-# IN / OUT counting (person cameras): draw a region with `count_zone`, a polygon of >= 3 points.
-# A person whose feet go from outside to inside is one IN; inside to outside is one OUT.
+# IN / OUT counting (person cameras): a straight line `roi: [x1, y1, x2, y2]` (its two ends).
+# A person whose feet cross the line in `in_direction` (down | up | right | left, default down)
+# is one IN; the opposite direction is one OUT. Each person is counted once.
 # Points are pixels in the delivered resolution, or 0..1 fractions of width/height:
-#    count_zone: [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]]   # right half of the frame
-# Totals go to person_counts (in_count / out_count / zone_count per interval) and every single
-# crossing to person_crossings (camera_id, track_id, direction, ts).
+#    roi: [0.0, 0.6, 1.0, 0.6]      # horizontal line across the frame, 60% down
+#    in_direction: down
+# Totals go to tbl_person_counts (one In + one Out row per device per day).
 
 defaults:
   codec: h264          # h264 | h265 | auto

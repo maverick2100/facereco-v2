@@ -7,13 +7,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config.settings import CameraConfig, DetectionSettings, RecognitionSettings, StorageSettings  # noqa: E402
+from config.settings import CameraConfig, DetectionSettings, RecognitionSettings  # noqa: E402
 from constants import UNKNOWN_PERSON_ID  # noqa: E402
-from database.connection import Database  # noqa: E402
-from database.embedding_repository import EmbeddingRepository  # noqa: E402
-from database.event_repository import EventRepository  # noqa: E402
-from database.person_repository import PersonRepository  # noqa: E402
-from database.schema import init_schema  # noqa: E402
 from fakes import FakeArcFaceModel, FakeSCRFDModel  # noqa: E402
 from inference.arcface_engine import ArcFaceEngine  # noqa: E402
 from inference.scrfd_engine import SCRFDEngine  # noqa: E402
@@ -22,9 +17,7 @@ from monitoring.performance import PerformanceTracker  # noqa: E402
 from recognition.duplicate_filter import DuplicateFilter, TrackCache  # noqa: E402
 from recognition.embedding_manager import EmbeddingGallery  # noqa: E402
 from recognition.face_matcher import FaceMatcher  # noqa: E402
-from recognition.identity_manager import IdentityManager  # noqa: E402
 from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
-from services.event_service import EventService  # noqa: E402
 from services.recognition_service import RecognitionService  # noqa: E402
 
 
@@ -84,21 +77,6 @@ def test_track_cache_reuse_and_reverify():
     assert t.lookup("c1", [5, 5, 105, 105], now=2.5) is None  # needs re-verification
 
 
-def test_identity_manager_hot_reload():
-    db = Database(":memory:")
-    init_schema(db)
-    persons, emb = PersonRepository(db), EmbeddingRepository(db)
-    g = EmbeddingGallery()
-    idm = IdentityManager(persons, emb, g, reload_interval_s=0)
-    idm.reload()
-    assert g.size == 0
-    pid = persons.create("Carol")
-    emb.add(pid, np.ones(512, np.float32))
-    assert idm.maybe_reload() and g.size == 1 and idm.name_of(pid) == "Carol"
-    assert not idm.maybe_reload()
-    assert idm.name_of(UNKNOWN_PERSON_ID) == "unknown"
-
-
 class _FakeInference:
     def __init__(self):
         self.scrfd = SCRFDEngine(FakeSCRFDModel())
@@ -111,42 +89,54 @@ class _FakeInference:
         return self.arcface.embed_batch(crops)
 
 
-def test_end_to_end_pipeline_with_fake_models():
-    db = Database(":memory:")
-    init_schema(db)
-    persons, emb_repo, ev_repo = PersonRepository(db), EmbeddingRepository(db), EventRepository(db)
-    inf = _FakeInference()
+class _FakeOffenders:
+    """Stands in for OffenderRepository: one enrolled vector in tbl_offenders, logs kept in memory."""
 
+    def __init__(self, vec):
+        self.vec = _unit(vec)
+        self.searches = 0
+        self.logs = []
+
+    def search(self, embedding):
+        self.searches += 1
+        return {"offender_id": 7, "offender_name": "Dave", "similarity": float(np.dot(self.vec, _unit(embedding)))}
+
+    def log_search(self, **row):
+        self.logs.append(row)
+        return len(self.logs)
+
+
+def test_end_to_end_pipeline_with_fake_models(monkeypatch, tmp_path):
+    monkeypatch.setenv("FR_OFFENDER_IMAGE_BASE_URL", "https://faces.example.com")
+    monkeypatch.setenv("FR_DETECTED_IMAGE_DIR", str(tmp_path / "detected"))
+    inf = _FakeInference()
     rng = np.random.default_rng(1)
     frame = rng.integers(0, 255, (720, 1280, 3)).astype(np.uint8)
     dets, kps = inf.detect([frame])[0]
     from processing.face_alignment import norm_crop
 
-    pid = persons.create("Dave")
-    emb_repo.add(pid, inf.embed([norm_crop(frame, kps[0])])[0])
-
-    gallery = EmbeddingGallery()
-    identity = IdentityManager(persons, emb_repo, gallery, reload_interval_s=1e9)
-    identity.reload()
+    offenders = _FakeOffenders(inf.embed([norm_crop(frame, kps[0])])[0])
     perf = PerformanceTracker()
-    events = EventService(ev_repo, StorageSettings(event_flush_interval_s=0.05), perf)
     sched = FrameScheduler(max_frame_age_s=5)
-    cams = [CameraConfig(camera_id="c1", name="c1", url="test://")]
-    recv = FrameReceiver("c1", sched.register("c1"))
+    cams = [CameraConfig(camera_id="27", name="gate", url="test://", gate_id=11)]
+    recv = FrameReceiver("27", sched.register("27"))
     det_cfg = DetectionSettings(min_face_size=20)
     rec_cfg = RecognitionSettings(blur_threshold=1.0, min_quality=0.0, max_yaw_ratio=1.0)
-    svc = RecognitionService(inf, sched, identity, FaceMatcher(gallery, 0.45, 0.05), DuplicateFilter(60),
-                             TrackCache(0.45, 2.0), events, cams, det_cfg, rec_cfg, perf)
-    events.start()
+    svc = RecognitionService(inf, sched, offenders, DuplicateFilter(60), TrackCache(0.45, 2.0),
+                             cams, det_cfg, rec_cfg, perf)
     svc.start()
     for _ in range(4):
         recv(frame)
         time.sleep(0.1)
     time.sleep(0.3)
     svc.stop()
-    events.stop()
 
-    rows = ev_repo.query()
-    assert len(rows) == 1, rows  # de-duplicated
-    assert rows[0]["person_id"] == pid and rows[0]["label"] == "Dave"
-    assert perf.count("faces_track_reused") >= 1  # later frames skipped ArcFace
+    assert offenders.searches >= 1
+    assert perf.count("recognized") == 1 and len(offenders.logs) == 1  # de-duplicated: one log row
+    row = offenders.logs[0]
+    assert (row["device_id"], row["gate_id"], row["offender_id"]) == (27, 11, 7)
+    assert row["match_percentage"] > 99 and row["time_taken_ms"] > 0 and row["frameno"] >= 0
+    assert len(row["embedding"]) == 512
+    assert row["detected_imagepath"].startswith("https://faces.example.com/images/detected/")
+    assert row["detected_imagepath"].endswith("_frame.jpg") and row["detected_face"].endswith("_face.jpg")
+    assert len(list((tmp_path / "detected").glob("*.jpg"))) == 2         # frame + face saved

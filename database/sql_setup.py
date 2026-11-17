@@ -1,12 +1,12 @@
-"""Create the PostgreSQL objects the frontend flow needs, so nobody has to run psql by hand.
+"""Install the stored procedures the frontend flow needs. Never creates tables.
 
-    database/sql/camera_config_postgres.sql  camera_config + sp_get_cameras / sp_upsert_camera /
-                                             sp_delete_camera + the NOTIFY camera_changed trigger
+    database/sql/camera_config_postgres.sql  sp_get_cameras / sp_upsert_camera / sp_delete_camera +
+                                             the NOTIFY camera_changed trigger (applied only when
+                                             the camera_config table already exists)
     database/sql/dashboard_postgres.sql      sp_dash_* (read-only dashboard queries)
 
-`ensure_sql_objects(db)` applies a file only when its objects are missing, so a database where you
-already created (or customised) them is left alone. `force=True` re-applies both files, e.g. after
-pulling a newer version of them. Both files are CREATE ... IF NOT EXISTS / CREATE OR REPLACE.
+`ensure_sql_objects(db)` applies a file only when its functions are missing, so a database where you
+already created (or customised) them is left alone. `force=True` re-applies them.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import logging
 from pathlib import Path
 from typing import List
 
-from database.schema import init_schema
 
 log = logging.getLogger(__name__)
 
@@ -39,13 +38,15 @@ def _table_exists(db, name: str) -> bool:
 
 
 def ensure_sql_objects(db, force: bool = False) -> List[str]:
-    """Create facereco's tables, then any missing camera / dashboard SPs. Returns the files applied."""
+    """Install any missing camera / dashboard SPs. Returns the files applied."""
     if getattr(db, "backend", "sqlite") != "postgres":
         raise RuntimeError("The camera table and stored procedures need PostgreSQL "
                            "(set FR_DATABASE_URL or FR_PG_HOST in .env)")
-    init_schema(db)                                  # cameras / events / person_counts / ... (dashboard SPs read them)
     applied = []
-    if force or not _table_exists(db, "camera_config") or _missing_functions(db, _CAMERA_FUNCS):
+    if not _table_exists(db, "camera_config"):
+        log.warning("Table camera_config does not exist - skipping %s (facereco does not create tables)",
+                    CAMERA_SQL.name)
+    elif force or _missing_functions(db, _CAMERA_FUNCS):
         db.executescript(CAMERA_SQL.read_text(encoding="utf-8"))
         applied.append(CAMERA_SQL.name)
     if force or _missing_functions(db, _DASH_FUNCS):

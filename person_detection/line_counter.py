@@ -15,7 +15,10 @@ Rules that keep the count clean:
   * the point must also have moved at least `min_distance` px away from the line (a dead band);
   * the crossing must happen between the two ends of the line (people walking past the end of a
     short line aren't counted);
-  * a person first seen already on one side sets their starting side but isn't counted.
+  * a person first seen already on one side sets their starting side but isn't counted;
+  * count_once (default): a tracked person is counted once, in the direction of their first
+    crossing. A later crossing back by the same person (feet bouncing over the line while they
+    stand at the door, the box shrinking behind a door frame) does not add an OUT.
 """
 from __future__ import annotations
 
@@ -62,11 +65,13 @@ class _State:
     pending: int = 0
     streak: int = 0
     last: Optional[Tuple[float, float]] = None   # last point on the confirmed side (to locate the crossing)
+    counted: bool = False                        # already counted IN or OUT (count_once)
 
 
 class LineCounter:
     def __init__(self, camera_id: str, line: Sequence[float], in_direction: str = "down",
-                 anchor: str = "bottom", min_frames: int = 2, min_distance: float = 4.0) -> None:
+                 anchor: str = "bottom", min_frames: int = 2, min_distance: float = 4.0,
+                 count_once: bool = True) -> None:
         if anchor not in ANCHORS:
             raise ValueError(f"anchor must be one of {ANCHORS}, got {anchor!r}")
         in_direction = (in_direction or "down").strip().lower()
@@ -96,6 +101,7 @@ class LineCounter:
         self.anchor = anchor
         self.min_frames = max(1, int(min_frames))
         self.min_distance = max(0.0, float(min_distance))
+        self.count_once = bool(count_once)
         self._states: Dict[int, _State] = {}
         self.total_in = 0
         self.total_out = 0
@@ -142,6 +148,9 @@ class LineCounter:
             st.side, st.pending, st.streak, st.last = side, 0, 0, (float(p[0]), float(p[1]))
             if not self._between_ends((prev + p) / 2.0):  # walked around the end of the line
                 continue
+            if self.count_once and st.counted:            # same person crossing back: already counted
+                continue
+            st.counted = True
             movement = self.positive if side > 0 else self.negative
             if movement == self.in_direction:
                 self.total_in += 1

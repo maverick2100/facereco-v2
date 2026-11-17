@@ -1,10 +1,13 @@
-"""PostgreSQL bridge to the offender search function."""
+"""Offender matching against tbl_offenders and the search log (tbl_offender_search_logs).
+
+Both tables must already exist - facereco never creates tables.
+"""
 from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
-from typing import Any, Dict
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -30,40 +33,50 @@ def offender_table_sql() -> str:
 
 
 def offender_search_log_table_sql() -> str:
-    """Return the configured offender search log table (default public.offender_search_log)."""
-    return _configured_table_sql("FR_OFFENDER_SEARCH_LOG_TABLE", "public.offender_search_log")
+    """Return the configured offender search log table (default public.tbl_offender_search_logs)."""
+    return _configured_table_sql("FR_OFFENDER_SEARCH_LOG_TABLE", "public.tbl_offender_search_logs")
+
+
+def pg_array(vec: np.ndarray) -> list:
+    return np.asarray(vec, dtype=np.float64).reshape(-1).tolist()
 
 
 class OffenderRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def search(self, camera_id: str, embedding: np.ndarray, capture_ts: float) -> Dict[str, Any]:
-        """Call fn_search_offender; camera IDs like cam01 map to integer 1."""
-        match = re.search(r"(\d+)$", str(camera_id))
-        if not match:
-            raise ValueError(f"camera_id {camera_id!r} has no numeric suffix for fn_search_offender")
-        values = np.asarray(embedding, dtype=np.float64).reshape(-1)
-        pg_array_text = "{" + ",".join(format(float(v), ".17g") for v in values) + "}"
-        capture_time = datetime.fromtimestamp(capture_ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        row = self.db.fetchone(
-            "SELECT * FROM public.fn_search_offender(?, ?, ?)",
-            (int(match.group(1)), pg_array_text, capture_time),
+    def search(self, embedding: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Best active tbl_offenders row by cosine similarity: {offender_id, offender_name, similarity}.
+
+        None when the table has no active row with an embedding of the same length.
+        """
+        return self.db.fetchone(
+            "WITH q AS (SELECT ?::double precision[] AS v) "
+            "SELECT o.offender_id, o.offender_name, s.similarity "
+            f"FROM {offender_table_sql()} o CROSS JOIN q "
+            "CROSS JOIN LATERAL ("
+            "    SELECT SUM(p.val * o.embedding[p.i::int]) / "
+            "           NULLIF(SQRT(SUM(p.val * p.val) * SUM(o.embedding[p.i::int] * o.embedding[p.i::int])), 0)"
+            "           AS similarity "
+            "    FROM UNNEST(q.v) WITH ORDINALITY AS p(val, i)"
+            ") s "
+            "WHERE o.is_active = TRUE AND CARDINALITY(o.embedding) = CARDINALITY(q.v) AND s.similarity IS NOT NULL "
+            "ORDER BY s.similarity DESC LIMIT 1",
+            (pg_array(embedding),),
         )
-        if row is None:
-            raise RuntimeError("fn_search_offender returned no row")
-        result = dict(row)
-        if result.get("matched_offender_id") is not None:
-            mapping = self.db.fetchone(
-                "SELECT person_id FROM public.offender_embedding_sync WHERE offender_id = ?",
-                (int(result["matched_offender_id"]),),
-            )
-            if mapping is None:
-                mapping = self.db.fetchone(
-                    "SELECT person_id FROM public.offender_sync WHERE offender_id = ?",
-                    (int(result["matched_offender_id"]),),
-                )
-            result["person_id"] = int(mapping["person_id"]) if mapping else None
-        else:
-            result["person_id"] = None
-        return result
+
+    def log_search(self, device_id: Any, gate_id: Optional[int], offender_id: Optional[int],
+                   embedding: np.ndarray, frameno: int, detected_imagepath: Optional[str],
+                   detected_face: Optional[str], match_percentage: float, time_taken_ms: float,
+                   capture_time: datetime) -> Optional[int]:
+        """Insert one row into tbl_offender_search_logs and return its log_id."""
+        row = self.db.fetchone(
+            f"INSERT INTO {offender_search_log_table_sql()} (device_id, gate_id, offender_id, offender_embedding, "
+            "frameno, detected_imagepath, detected_face, match_percentage, time_taken, capture_time, is_active, "
+            "created_date, updated_date) "
+            "VALUES (?, ?, ?, ?::double precision[], ?, ?, ?, ?, ?, ?, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+            "RETURNING log_id",
+            (device_id, gate_id, offender_id, pg_array(embedding), int(frameno), detected_imagepath,
+             detected_face, round(float(match_percentage), 2), round(float(time_taken_ms), 1), capture_time),
+        )
+        return int(row["log_id"]) if row and row.get("log_id") is not None else None

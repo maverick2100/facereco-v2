@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import HTTPException  # noqa: E402
 
@@ -23,7 +24,7 @@ from services.camera_source import CameraSource  # noqa: E402
 
 PG_URL = os.environ.get("FR_TEST_DATABASE_URL", "")
 GATE = {"camera_id": "gate1", "name": "Main Gate", "url": "rtsp://admin:s3cr%40t@10.0.0.5:554/stream1",
-        "run_person": True, "count_zone": [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]}
+        "run_person": True, "roi": [0.5, 0, 0.5, 1]}
 
 
 # ------------------------------------------------------------------------------------------- URL helpers
@@ -47,6 +48,11 @@ def pg():
 
     db = PostgresDatabase(PG_URL, min_size=1, max_size=4)
     db.executescript("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+    from database.sql_setup import CAMERA_SQL
+    from schema_sql import create_tables
+
+    create_tables(db)                       # facereco itself never creates tables
+    db.executescript(CAMERA_SQL.read_text(encoding="utf-8"))
     yield db
     db.close()
 
@@ -64,7 +70,7 @@ def _settings(api_key=""):
 def client(pg):
     from fastapi.testclient import TestClient
 
-    with TestClient(create_app(_settings(), db=pg)) as c:   # start-up creates camera_config + the SPs
+    with TestClient(create_app(_settings(), db=pg)) as c:   # start-up installs the SPs
         yield c
 
 
@@ -88,7 +94,7 @@ def test_save_camera_starts_use_case(client, pg):
     # the real reader facereco uses, against the same table
     cams = CameraSource(_settings().camera_source, _settings().storage).load()
     assert [(c.camera_id, c.tasks, c.url) for c in cams] == [("gate1", ["person"], GATE["url"])]
-    assert cams[0].count_zone[0] == [640.0, 0.0]                      # fractions -> pixels (1280 wide)
+    assert cams[0].roi == [640.0, 0.0, 640.0, 720.0]                  # fractions -> pixels (1280x720)
 
 
 def test_patch_start_stop_delete(client, pg):
@@ -125,7 +131,7 @@ def test_masked_password_round_trip_keeps_stored_password(client, pg):
 @pytest.mark.parametrize("change", [
     {"url": "ftp://10.0.0.5/x"},
     {"url": "not a url"},
-    {"count_zone": [[0, 0], [1, 1]]},
+    {"count_zone": [[0.5, 0], [1, 0], [1, 1]]},           # polygons are not accepted
     {"roi": [10, 10, 5, 5]},
     {"fps": 0},
     {"codec": "mpeg2"},
@@ -176,16 +182,6 @@ def test_dashboard_endpoints(client, pg):
     assert client.get("/dashboard/cameras").status_code == 200
     r = client.get("/dashboard/summary", params={"tz": "Mars/Base"})
     assert r.status_code == 400, r.text
-
-
-def test_events_endpoint(client, pg):
-    pid = pg.insert("INSERT INTO persons (name, created_at, updated_at) VALUES ('Alice', 0, 0)")
-    now = time.time()
-    pg.executemany("INSERT INTO events (camera_id, person_id, label, similarity, ts) VALUES (?, ?, ?, ?, ?)",
-                   [("gate1", pid, "Alice", 0.8, now - 10), ("gate1", None, "unknown", 0.2, now - 5)])
-    ev = client.get("/events").json()
-    assert [e["label"] for e in ev] == ["unknown", "Alice"]
-    assert [e["person_name"] for e in client.get("/events", params={"known_only": True}).json()] == ["Alice"]
 
 
 def test_api_key(pg):

@@ -178,6 +178,7 @@ class PersonSettings:
     line_anchor: str = "bottom"      # point of the box that crosses the roi line: bottom (feet) | center
     line_min_frames: int = 2         # frames a person must stay on the new side before IN/OUT counts
     line_min_distance: float = 4.0   # px a person must be past the line (dead band against jitter)
+    line_count_once: bool = True     # each tracked person counts once (IN or OUT), never IN and OUT
     in_direction: str = "down"       # crossing that is IN: down | up (horizontal line), right | left (vertical)
     init_sql: str = "SELECT * FROM public.fn_initialize_device_personcount()"  # starting totals ("" = start at 0)
     update_sql: str = "CALL sp_upsert_person_count_update(?, ?, ?, ?)"  # (device, in, out, time); "" = off
@@ -230,9 +231,6 @@ class StorageSettings:
     db_path: Path = DEFAULT_DB_PATH
     save_snapshots: bool = False
     snapshot_quality: int = 85
-    event_flush_interval_s: float = 1.0
-    event_batch_size: int = 100
-    event_queue_size: int = 5000
     retention_days: int = 90
     # PostgreSQL: set database_url OR pg_host (+ pg_user / pg_password / pg_database). Empty = SQLite (db_path).
     database_url: str = ""
@@ -380,9 +378,10 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         track_max_age_s=_env("FR_PERSON_TRACK_MAX_AGE_S", 2.0),
         track_min_hits=_env("FR_PERSON_TRACK_MIN_HITS", 2),
         flush_interval_s=_env("FR_PERSON_FLUSH_S", 60.0),
-        line_anchor=_env("FR_PERSON_LINE_ANCHOR", _env("FR_PERSON_ZONE_ANCHOR", "bottom")),
-        line_min_frames=_env("FR_PERSON_LINE_MIN_FRAMES", _env("FR_PERSON_ZONE_MIN_FRAMES", 2)),
+        line_anchor=_env("FR_PERSON_LINE_ANCHOR", "bottom"),
+        line_min_frames=_env("FR_PERSON_LINE_MIN_FRAMES", 2),
         line_min_distance=_env("FR_PERSON_LINE_MIN_DISTANCE", 4.0),
+        line_count_once=_env("FR_PERSON_COUNT_ONCE", True),
         in_direction=_env("FR_PERSON_IN_DIRECTION", "down").lower(),
         init_sql=_env("FR_PERSON_INIT_SQL", PersonSettings.init_sql),
         update_sql=_env("FR_PERSON_UPDATE_SQL", PersonSettings.update_sql),
@@ -425,9 +424,6 @@ def load_settings(env_file: Optional[Path] = None, cameras_file: Optional[Path] 
         db_path=_env_path("FR_DB_PATH", DEFAULT_DB_PATH),
         save_snapshots=_env("FR_SAVE_SNAPSHOTS", False),
         snapshot_quality=_env("FR_SNAPSHOT_QUALITY", 85),
-        event_flush_interval_s=_env("FR_EVENT_FLUSH_S", 1.0),
-        event_batch_size=_env("FR_EVENT_BATCH", 100),
-        event_queue_size=_env("FR_EVENT_QUEUE", 5000),
         retention_days=_env("FR_RETENTION_DAYS", 90),
         database_url=str(_env("FR_DATABASE_URL", "")),
         pg_host=str(_env("FR_PG_HOST", "")),

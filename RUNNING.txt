@@ -32,7 +32,7 @@ A and B can be used together: both write the same table.
                                                    |     | trigger:                |
                                                    |     | NOTIFY camera_changed   |
                                                    |     v                         |
-                                                   |  events / person_counts /     |
+                                                   |  person_counts /              |
                                                    |  person_crossings  (results)  |
                                                    +-----|-----------------^-------+
                                     sp_get_cameras()     |                 | results written
@@ -40,15 +40,16 @@ A and B can be used together: both write the same table.
   +---------+   RTSP video      +--------------------------------------------------+
   | Cameras | ----------------> | facereco  (python main.py run --api)             |
   +---------+                   |   face   -> SCRFD + ArcFace  (Neural Engine)     |
-                                |   person -> YOLOv7 + tracker + IN/OUT zone       |
+                                |   person -> YOLOv7 + tracker + IN/OUT line       |
                                 +--------------------------------------------------+
 
   Step by step:
-   1. User saves a camera on the dashboard (name, RTSP URL, 2 checkboxes, zone)
+   1. User saves a camera on the dashboard (name, RTSP URL, 2 checkboxes, line)
    2. Dashboard calls the API -> API calls sp_upsert_camera -> row in camera_config
    3. Database trigger sends NOTIFY camera_changed
    4. facereco wakes up, calls sp_get_cameras(), starts the checked use cases
-   5. Results are written to events / person_counts / person_crossings
+   5. Face matches go through fn_search_offender (its search log table);
+      person counts go to person_counts / person_crossings
    6. Dashboard calls GET /dashboard/... -> API calls sp_dash_*() -> numbers
 
   WITHOUT DASHBOARD (C)
@@ -140,11 +141,11 @@ What the dashboard calls:
       "url": "rtsp://admin:pass@192.168.1.101:554/Streaming/Channels/102",
       "run_face": true,
       "run_person": true,
-      "count_zone": [[0.5,0],[1,0],[1,1],[0.5,1]]     <- optional, for IN/OUT
+      "roi": [0.5, 0, 0.5, 1]                         <- optional IN/OUT line [x1,y1,x2,y2]
     }
 
   Turn a use case on/off:   PATCH /cameras/gate1        {"run_face": false}
-  Change the zone:          PATCH /cameras/gate1        {"count_zone": [[...]]}
+  Move the line:            PATCH /cameras/gate1        {"roi": [x1, y1, x2, y2]}
   Stop / start a camera:    POST  /cameras/gate1/stop   POST /cameras/gate1/start
   Delete a camera:          DELETE /cameras/gate1
   List cameras + live state: GET /cameras        (state: streaming / starting / stopped)
@@ -155,9 +156,6 @@ What the dashboard calls:
     GET /dashboard/daily?from=2026-11-01&to=2026-11-16
     GET /dashboard/cameras             one row per camera
       filters: day=2026-11-16  cameras=gate1,hall2  tz=Asia/Kolkata
-
-  Face recognition results:
-    GET /events?known_only=true&limit=50
 
   Status:  GET /status   GET /health
 
@@ -185,9 +183,10 @@ Start facereco (API optional):
 
 Your backend runs SQL on the same database:
 
-  -- add / update a camera:  id, name, url, run_face, run_person, zone (optional)
-  SELECT sp_upsert_camera('gate1', 'Main Gate', 'rtsp://admin:pass@192.168.1.101/stream',
-                          true, true, '[[0.5,0],[1,0],[1,1],[0.5,1]]');
+  -- add / update a camera:  id, name, url, run_face, run_person, roi line (optional)
+  SELECT sp_upsert_camera(p_camera_id => 'gate1', p_name => 'Main Gate',
+                          p_url => 'rtsp://admin:pass@192.168.1.101/stream',
+                          p_run_face => true, p_run_person => true, p_roi => '[0.5, 0, 0.5, 1]');
 
   UPDATE camera_config SET enabled = false WHERE camera_id = 'gate1';   -- stop
   UPDATE camera_config SET enabled = true  WHERE camera_id = 'gate1';   -- start
@@ -199,7 +198,6 @@ Your backend runs SQL on the same database:
   SELECT * FROM sp_dash_hourly_in_out();
   SELECT * FROM sp_dash_daily_totals('2026-11-01', '2026-11-16');
   SELECT * FROM sp_dash_camera_counts();
-  SELECT * FROM events ORDER BY ts DESC LIMIT 20;    -- recognised faces
 
 If the tables/SPs don't exist yet:  python main.py db-setup
 Plain INSERT / UPDATE / DELETE on camera_config work too (the trigger fires on any change).
@@ -225,7 +223,7 @@ config/cameras.yaml:
       name: Main Gate
       url: rtsp://admin:pass@192.168.1.101:554/Streaming/Channels/102
       tasks: [face, person]                               # both use cases
-      count_zone: [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]    # optional, IN/OUT
+      roi: [0.5, 0, 0.5, 1]                               # optional IN/OUT line
 
     - camera_id: hall2
       name: Hall
@@ -240,7 +238,6 @@ Edits to cameras.yaml are picked up within 30 seconds, no restart needed.
 
 See results:
   python main.py counts --since 2026-11-16     # people / IN / OUT per camera
-  python main.py export --since 2026-11-16     # face events -> CSV in data/exports/
   curl localhost:8085/cameras                  # which cameras are streaming
 
 Moving to the database later:  python scripts/migrate_sqlite_to_postgres.py

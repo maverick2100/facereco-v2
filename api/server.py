@@ -18,7 +18,7 @@ import json
 import logging
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 MASK = "***"
 URL_SCHEMES = ("rtsp", "rtsps", "http", "https")
 CAMERA_ID_PATTERN = r"^[A-Za-z0-9_.-]{1,64}$"
-_CAMERA_COLUMNS = ("camera_id, name, location, url, run_face, run_person, count_zone, roi, fps, width, height, "
+_CAMERA_COLUMNS = ("camera_id, name, location, url, run_face, run_person, roi, fps, width, height, "
                    "codec, enabled, updated_at")
 
 
@@ -246,11 +246,11 @@ def create_app(settings: Settings, db=None) -> FastAPI:
             raise HTTPException(422, str(exc))
         d.execute(
             "SELECT sp_upsert_camera(p_camera_id => ?::text, p_name => ?::text, p_url => ?::text, "
-            "p_run_face => ?::boolean, p_run_person => ?::boolean, p_count_zone => ?::jsonb, "
+            "p_run_face => ?::boolean, p_run_person => ?::boolean, "
             "p_location => ?::text, p_enabled => ?::boolean, p_fps => ?::real, p_width => ?::integer, "
             "p_height => ?::integer, p_roi => ?::jsonb, p_codec => ?::text)",
             (camera_id, f["name"], f["url"], f["run_face"], f["run_person"],
-             None, f.get("location") or "",                       # count_zone: replaced by the roi line
+             f.get("location") or "",
              f["enabled"], f.get("fps"), f.get("width"), f.get("height"),
              json.dumps(f["roi"]) if f.get("roi") else None, f.get("codec")))
 
@@ -384,26 +384,6 @@ def create_app(settings: Settings, db=None) -> FastAPI:
              summary="Per-camera numbers for one day")
     def dash_cameras(day: Optional[date] = None, tz: Optional[str] = tz_q, d=Depends(database)):
         return d.fetchall("SELECT * FROM sp_dash_camera_counts(?::date, ?::text)", (day, tz or api_cfg.timezone))
-
-    # ------------------------------------------------------------------ face recognition events
-    @app.get("/events", tags=["dashboard"], dependencies=[Depends(check_key)],
-             summary="Recognised faces, newest first")
-    def events(since: Optional[datetime] = None, until: Optional[datetime] = None,
-               camera: Optional[str] = None, known_only: bool = False,
-               limit: int = Query(100, ge=1, le=1000), d=Depends(database)):
-        def epoch(t: Optional[datetime]) -> Optional[float]:
-            if t is None:
-                return None
-            return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp()
-
-        return d.fetchall(
-            "SELECT e.id, e.camera_id, e.person_id, p.name AS person_name, e.label, e.similarity, "
-            "       to_timestamp(e.ts) AS time "
-            "FROM events e LEFT JOIN persons p ON p.id = e.person_id "
-            "WHERE (?::float8 IS NULL OR e.ts >= ?::float8) AND (?::float8 IS NULL OR e.ts < ?::float8) "
-            "  AND (?::text IS NULL OR e.camera_id = ?::text) AND (NOT ?::boolean OR e.person_id IS NOT NULL) "
-            "ORDER BY e.ts DESC LIMIT ?::integer",
-            (epoch(since), epoch(since), epoch(until), epoch(until), camera, camera, known_only, limit))
 
     return app
 

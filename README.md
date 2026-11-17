@@ -60,25 +60,26 @@ cameras:
 
 | `tasks` | Runs | Writes to |
 |---|---|---|
-| `[face]` | SCRFD + ArcFace recognition | `events` |
+| `[face]` | SCRFD + ArcFace recognition | offender search log (via `fn_search_offender`) |
 | `[person]` | YOLOv7 person detection + counting | `person_counts` |
 | `[face, person]` | both | both |
 
-**Counting people IN and OUT of a region:** add a `count_zone` polygon to a person camera. A person whose feet move from outside the region to inside counts as one **IN**, and inside to outside counts as one **OUT**. The new side must hold for `FR_PERSON_ZONE_MIN_FRAMES` frames (default 2), so someone standing on the edge isn't counted again and again. Points can be pixels or 0–1 fractions of the frame, which is what a frontend drawing tool usually gives.
+**Counting people IN and OUT across a line:** give a person camera a `roi` line `[x1, y1, x2, y2]` (its two ends). A person whose feet cross it in the camera's `in_direction` (`down`, `up`, `right` or `left`, default `down`) counts as one **IN**; the opposite direction is one **OUT**. Each tracked person is counted once, so feet bouncing back over the line at a door don't add an OUT (`FR_PERSON_COUNT_ONCE`). The new side must hold for `FR_PERSON_LINE_MIN_FRAMES` frames (default 2). Points can be pixels or 0–1 fractions of the frame.
 
 ```yaml
   - camera_id: cam05
     url: rtsp://...
     tasks: [person]
-    count_zone: [[0.5, 0.0], [1.0, 0.0], [1.0, 1.0], [0.5, 1.0]]   # right half of the frame
+    roi: [0.0, 0.6, 1.0, 0.6]      # horizontal line across the frame, 60% down
+    in_direction: down             # walking down across it = IN
 ```
 
 | Table | What it holds |
 |---|---|
-| `person_counts` | one row per camera every `FR_PERSON_FLUSH_S`, now with `in_count`, `out_count`, `zone_count` (people inside the region at the end of the interval) |
+| `person_counts` | one row per camera every `FR_PERSON_FLUSH_S`, now with `in_count`, `out_count`, `zone_count` (IN − OUT occupancy at the end of the interval) |
 | `person_crossings` | one row per crossing: `camera_id`, `track_id`, `direction` (`in`/`out`), `ts`, `x`, `y`. Written in one batch every ~2 s |
 
-`python main.py counts` shows IN/OUT per camera, and `run --show` draws the region with live IN/OUT totals. Existing databases get the new columns automatically on start-up.
+`python main.py counts` shows IN/OUT per camera, and `run --show` draws the line with live IN/OUT totals.
 
 Passwords may contain special characters (`@ # / ?`). They're handled automatically and are never written to the database.
 
@@ -105,7 +106,7 @@ If both are set, the `FR_PG_*` fields override the matching part of the URL. The
 
 ```bash
 python main.py db-check                       # prints OK + row counts, or the connection error
-python scripts/migrate_sqlite_to_postgres.py  # optional: copy existing SQLite data (people, faces, events)
+python scripts/migrate_sqlite_to_postgres.py  # optional: copy existing SQLite data (people, person counts)
 ```
 
 `.env` is in `.gitignore`, so your credentials stay out of git, and the password is masked in every log line.
@@ -119,9 +120,9 @@ FR_CAMERA_SOURCE=db
 FR_CAMERA_SQL=SELECT * FROM sp_get_cameras()   # or your own SP / query
 ```
 
-`python main.py run` then calls the SP and starts the right use case on each camera. Results go to the same tables as before (`events`, `person_counts`, `person_crossings`). When the SP's answer changes (a camera is added, removed or switched between face and person, or its zone is redrawn), the system saves what it has counted so far and restarts the pipelines with the new list. This takes a few seconds and needs no manual restart.
+`python main.py run` then calls the SP and starts the right use case on each camera. Face matches are logged by `fn_search_offender`; person counts go to `person_counts` / `person_crossings`. When the SP's answer changes (a camera is added, removed or switched between face and person, or its IN/OUT line is moved), the system saves what it has counted so far and restarts the pipelines with the new list. This takes a few seconds and needs no manual restart.
 
-- **The SP's rows:** one row per camera. Columns `camera_id`, `url`, and either `tasks` (`face`, `person`, `face,person` or `both`) or boolean `face` / `person` columns. Optional columns: `name`, `location`, `enabled`, `count_zone`, `roi`, `fps`, `width`, `height`, `codec`. Common alternative names such as `id`, `rtsp_url`, `use_case` and `is_active` also work, other columns are ignored, and NULLs fall back to `defaults:` in `cameras.yaml`. A bad row is logged and skipped, and the other cameras keep running.
+- **The SP's rows:** one row per camera. Columns `camera_id`, `url`, and either `tasks` (`face`, `person`, `face,person` or `both`) or boolean `face` / `person` columns. Optional columns: `name`, `location`, `enabled`, `roi`, `fps`, `width`, `height`, `codec`. Common alternative names such as `id`, `rtsp_url`, `use_case` and `is_active` also work, other columns are ignored, and NULLs fall back to `defaults:` in `cameras.yaml`. A bad row is logged and skipped, and the other cameras keep running.
 - **Instant updates:** on PostgreSQL, anything that runs `NOTIFY camera_changed` triggers an immediate reload. Otherwise changes are picked up by a re-check every `FR_CAMERA_POLL_S` (30 s).
 - **No SP yet?** [database/sql/camera_config_postgres.sql](database/sql/camera_config_postgres.sql) creates a `camera_config` table, `sp_get_cameras()`, `sp_upsert_camera(...)`, `sp_delete_camera(...)`, and a trigger that sends the NOTIFY:
 
@@ -129,11 +130,12 @@ FR_CAMERA_SQL=SELECT * FROM sp_get_cameras()   # or your own SP / query
   psql "$FR_DATABASE_URL" -f database/sql/camera_config_postgres.sql
   ```
   ```sql
-  SELECT sp_upsert_camera('cam07', 'Back door', 'rtsp://user:pass@10.0.0.7/stream2', false, true,
-                          '[[0.5,0],[1,0],[1,1],[0.5,1]]');   -- person counting with an IN/OUT zone
+  SELECT sp_upsert_camera(p_camera_id => 'cam07', p_name => 'Back door',
+                          p_url => 'rtsp://user:pass@10.0.0.7/stream2', p_run_face => false, p_run_person => true,
+                          p_roi => '[0.5, 0, 0.5, 1]');   -- person counting with an IN/OUT line
   ```
-- **End-to-end test:** `python scripts/e2e_test.py` adds two temporary cameras through the SPs and checks the whole chain against your database: pipelines start, face events, person counts and IN/OUT crossings arrive, a use-case change via the SP restarts within seconds, and a disabled camera stops. Then it removes them. Add `--fake-models` to test without `.mlpackage` files, or `--face-url` / `--person-url file:///clip.mp4` to use real video with the real models.
-- **Check it:** `python main.py cameras` prints what the SP returns, including which cameras run face, which run person counting, and which have a zone, without starting anything.
+- **End-to-end test:** `python scripts/e2e_test.py` adds two temporary cameras through the SPs and checks the whole chain against your database: pipelines start, person counts and IN/OUT crossings arrive, a use-case change via the SP restarts within seconds, and a disabled camera stops. Then it removes them. Add `--fake-models` to test without `.mlpackage` files, or `--face-url` / `--person-url file:///clip.mp4` to use real video with the real models.
+- **Check it:** `python main.py cameras` prints what the SP returns, including which cameras run face, which run person counting, and which have an IN/OUT line, without starting anything.
 
 ### 3d. Optional: HTTP API for the frontend
 
@@ -148,18 +150,17 @@ On start-up, facereco creates `camera_config` and all SPs if they're missing (`F
 
 | Endpoint | What it does |
 |---|---|
-| `POST /cameras` | Add a camera: `{"camera_id", "name", "url", "run_face", "run_person", "count_zone"?, ...}` |
+| `POST /cameras` | Add a camera: `{"camera_id", "name", "url", "run_face", "run_person", "roi"?, ...}` |
 | `PUT /cameras/{id}` | Add or replace (201 = created, 200 = updated) |
-| `PATCH /cameras/{id}` | Change only the fields sent, e.g. `{"run_face": true}` or a new `count_zone` |
+| `PATCH /cameras/{id}` | Change only the fields sent, e.g. `{"run_face": true}` or a new `roi` line |
 | `POST /cameras/{id}/start` · `/stop` | Turn a camera on or off (settings kept) |
 | `DELETE /cameras/{id}` | Remove a camera |
 | `GET /cameras` · `/cameras/{id}` | Cameras with `use_cases`, `state` (`streaming` / `starting` / `stopped` / ...) and live fps |
 | `GET /dashboard/summary` · `/hourly` · `/daily` · `/cameras` | Person-count numbers (`sp_dash_*`); filters `day`, `from`/`to`, `cameras=a,b`, `tz` |
-| `GET /events` | Recognised faces, newest first; filters `since`, `until`, `camera`, `known_only`, `limit` |
 | `GET /status` · `/health` | API, database and facereco status |
 
 - **Passwords:** `GET` returns camera URLs as `rtsp://user:***@host/...`. Sending that URL back unchanged keeps the stored password.
-- **Validation:** bad input (non-stream URL, zone with fewer than 3 points, unknown field) gets a 422 with the reason, before anything reaches facereco.
+- **Validation:** bad input (non-stream URL, a line whose two ends are the same point, unknown field) gets a 422 with the reason, before anything reaches facereco.
 - **Security:** the API listens on `127.0.0.1` by default. To serve other machines, set `FR_API_HOST=0.0.0.0` and `FR_API_KEY` (clients send `X-API-Key`). For a browser app on another origin, list it in `FR_API_CORS_ORIGINS`.
 
 ### 4. Add the models
@@ -227,16 +228,14 @@ Stop with **Ctrl+C**, which shuts down cleanly. With `--show`, you can also pres
 |---|---|
 | console / `logs/face_recognition.log` | a status line every 30 s (cameras, fps, ms per frame, CPU, memory) |
 | `logs/events.log` | one JSON line per recognition |
-| `data/face_recognition.db` | SQLite: persons, embeddings, events, person_counts |
+| `data/face_recognition.db` | SQLite: persons, person_counts |
 | `http://127.0.0.1:8085/health` | short status (`/metrics` = everything, `/cameras` = per camera) |
 | `data/exports/snapshots/` | face snapshots, if `FR_SAVE_SNAPSHOTS=true` |
 
 ### 8. Other commands
 
 ```bash
-python main.py export --since 2026-11-13 --until 2026-11-14   # CSV into data/exports/
-python main.py export --camera cam01 --known-only --out today.csv
-python main.py enroll --name "Alice" --images a.jpg b.jpg [--external-id E123] [--replace]
+python main.py enroll --name "Alice" --images a.jpg b.jpg [--replace]   # rows in tbl_offenders
 python main.py delete-person 3
 python main.py counts --since 2026-11-13                       # people per camera: total distinct + peak
 python main.py counts --camera cam05 --csv                     # every person_counts row -> data/exports/
@@ -275,15 +274,14 @@ This test used InsightFace `buffalo_l` (SCRFD-10G + ArcFace R50) converted with 
 cameras ─► GStreamer: rtspsrc ► vtdec (hardware) ► videorate (drop to N fps) ► BGR ► appsink
         ─► CameraQueue (newest frame only, per camera) ─► FrameScheduler (fair, drops stale frames)
         ─► [detector thread]   SCRFD on ANE, batch 4 ─► filter ─► track cache ─► align ─► quality gate
-        ─► [recognizer thread] ArcFace on ANE, batch 16 ─► match (one matrix multiply) ─► de-duplicate
-        ─► EventService (background, batched SQLite writes, snapshots, listeners)
+        ─► [recognizer thread] ArcFace on ANE, batch 16 ─► fn_search_offender (PostgreSQL) ─► de-duplicate ─► log
 ```
 
 - **Decoding** runs on the media engine. Only the analysed frames are colour-converted.
 - **Both models** run with `CPU_AND_NE`: Neural Engine plus CPU fallback, never the GPU.
 - **Quality gate:** blurry, side-on or too-small faces never reach ArcFace.
 - **Track cache:** a face that is still in view keeps its identity and is re-checked every 2 s.
-- **Matching** is one BLAS matrix multiply, under 1 ms for thousands of embeddings.
+- **Matching** happens in PostgreSQL (`fn_search_offender`) against the offender table.
 - **Thread pools** for numpy and OpenCV are limited to 1 thread.
 - **Compiled models** are cached in `models/.compiled/`, so startup takes under 0.1 s after the first run.
 
@@ -310,7 +308,7 @@ The code detects image vs. array inputs, output names and output layouts automat
 | `FR_TRACK_REVERIFY_S` | 2.0 | How often a tracked face is re-checked by ArcFace (0 = always) |
 | `FR_MIN_FACE_SIZE` | 40 | Ignore faces smaller than this (pixels) |
 | `FR_DET_BATCH` / `FR_REC_BATCH` | 4 / 16 | Larger means better ANE efficiency, slightly more latency |
-| `FR_RECORD_UNKNOWN` | true | Store events for unknown faces |
+| `FR_RECORD_UNKNOWN` | true | Log unknown faces too |
 | `FR_SAVE_SNAPSHOTS` | false | Save a JPEG of each recognized face |
 | `FR_COMPUTE_UNITS` | CPU_AND_NE | `ALL` lets Core ML also use the GPU |
 | `fps`, `roi`, `priority` | per camera | Load control in `cameras.yaml` |
@@ -341,7 +339,7 @@ processing/             letterbox / normalization, alignment, quality gate, NMS
 recognition/            embedding gallery, matcher, identity hot-reload, de-dup + track cache
 person_detection/       YOLOv7 engine, person tracker, per-interval counter, person-count service
 database/               SQLite (WAL) or PostgreSQL + repositories
-services/               enrolment, real-time recognition pipeline, event writer / CSV export
+services/               enrolment (writes the offender table), real-time recognition pipeline
 monitoring/             CPU, memory, ANE, performance counters, health HTTP endpoint
 scripts/                tests, benchmarks, DB init, ONNX -> Core ML converter
 tests/                  unit tests (fake models, no hardware needed)

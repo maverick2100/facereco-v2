@@ -19,7 +19,7 @@ def test_rows_with_tasks_text_flags_and_aliases():
     rows = [
         {"camera_id": "cam01", "name": "Gate", "url": "rtsp://a", "tasks": "face", "enabled": True},
         {"id": 2, "camera_name": "Hall", "rtsp_url": "rtsp://b", "use_case": "Person Detection",
-         "count_zone": "[[0.5,0],[1,0],[1,1],[0.5,1]]", "fps": None, "created_by": "admin"},
+         "roi": "[0.5, 0, 0.5, 1]", "fps": None, "created_by": "admin"},
         {"camera_id": "cam03", "url": "rtsp://c", "run_face": 1, "run_person": "true"},
         {"camera_id": "cam04", "url": "rtsp://d", "tasks": ["face", "person"], "is_active": "false"},  # off
         {"camera_id": "cam05", "url": "rtsp://e", "face": False, "person": False},                  # no use case
@@ -30,7 +30,7 @@ def test_rows_with_tasks_text_flags_and_aliases():
     assert cams["cam01"].tasks == ["face"]
     assert cams["2"].tasks == ["person"] and cams["2"].name == "Hall" and cams["2"].url == "rtsp://b"
     assert cams["2"].fps == 4                                       # NULL -> yaml default
-    assert cams["2"].count_zone[0] == [640.0, 0.0]                  # fractions -> pixels
+    assert cams["2"].roi == [640.0, 0.0, 640.0, 720.0]               # fractions -> pixels
     assert cams["cam03"].tasks == ["face", "person"]
     assert cams["cam06"].tasks == ["face", "person"] and cams["cam06"].roi == [0, 0, 640, 360]
 

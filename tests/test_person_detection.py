@@ -5,11 +5,12 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config.settings import CameraConfig  # noqa: E402
 from database.connection import Database  # noqa: E402
 from database.person_count_repository import PersonCountRepository  # noqa: E402
-from database.schema import init_schema  # noqa: E402
+from schema_sql import create_tables  # noqa: E402
 from inference.coreml_loader import FeatureSpec  # noqa: E402
 from ingestion.frame_receiver import FrameReceiver  # noqa: E402
 from person_detection.person_count_service import PersonCountService  # noqa: E402
@@ -158,7 +159,7 @@ def test_counter_interval_rows():
 
 def test_repository_insert_and_totals():
     db = Database(":memory:")
-    init_schema(db)
+    create_tables(db)
     repo = PersonCountRepository(db)
     repo.insert_many([("cam01", 0, 60, 240, 1, 0, 3, 1.2, 5, 4, 1, 3, 60),
                       ("cam01", 60, 120, 240, 0, 0, 2, 0.5, 2, 0, 3, 0, 120),
@@ -173,7 +174,7 @@ def test_repository_insert_and_totals():
 
 def test_service_end_to_end_writes_rows():
     db = Database(":memory:")
-    init_schema(db)
+    create_tables(db)
     repo = PersonCountRepository(db)
     cam = CameraConfig.from_dict({"camera_id": "cam01", "url": "test://", "tasks": ["person"]})
     sched = FrameScheduler(max_frame_age_s=5)
@@ -207,3 +208,30 @@ def test_frame_receiver_fans_out_to_each_task_queue():
     rx(np.zeros((4, 4, 3), np.uint8))
     f1, f2 = q1.pop_latest(), q2.pop_latest()
     assert f1 is f2 and f1.frame_id == 1
+
+
+def _walk(lc, tid, ys, t0=0.0):
+    """Feet of one tracked person at these y positions (x = 50), one frame each."""
+    out = []
+    for i, y in enumerate(ys):
+        out += lc.update([tid], np.array([[40, y - 100, 60, y]], np.float32), t0 + i)
+    return [c.direction for c in out]
+
+
+def test_person_walking_in_counts_only_in_even_if_feet_bounce_back():
+    from person_detection.line_counter import LineCounter
+
+    lc = LineCounter("16", [0, 100, 200, 100], in_direction="down")
+    # walks down across the line (IN), stops at the door, box bottom jumps back above the line, goes in
+    dirs = _walk(lc, 1, [60, 80, 120, 140, 140, 90, 85, 130, 150])
+    assert dirs == ["in"]
+    assert (lc.total_in, lc.total_out) == (1, 0)
+    assert _walk(lc, 2, [160, 140, 80, 60]) == ["out"]                  # someone else walks out
+    assert (lc.total_in, lc.total_out) == (1, 1)
+
+
+def test_count_once_off_keeps_old_behaviour():
+    from person_detection.line_counter import LineCounter
+
+    lc = LineCounter("16", [0, 100, 200, 100], in_direction="down", count_once=False)
+    assert _walk(lc, 1, [60, 80, 120, 140, 140, 90, 85, 130, 150]) == ["in", "out", "in"]

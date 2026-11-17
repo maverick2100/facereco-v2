@@ -61,7 +61,8 @@ class PersonCountService:
                                      anchor=settings.line_anchor, min_frames=settings.line_min_frames,
                                      min_distance=settings.line_min_distance,
                                      in_directions={c.camera_id: c.in_direction or settings.in_direction
-                                                    for c in cameras})
+                                                    for c in cameras},
+                                     count_once=settings.line_count_once)
         self._last_crossing_write = 0.0
         self._pushed: Dict[str, tuple] = {}   # camera_id -> (in, out) last sent to the update SP / table
         name = (settings.count_table or "").strip()

@@ -49,7 +49,7 @@ class _Interval:
         self.new = 0
         self.ins = 0
         self.outs = 0
-        self.zone = 0
+        self.inside = 0
 
     def add(self, count: int, new: int, ts: float) -> None:
         self.min = count if self.frames == 0 else min(self.min, count)
@@ -62,10 +62,10 @@ class _Interval:
 
 
 class CameraCounter:
-    def __init__(self, camera_id: str, tracker: PersonTracker, zone: Optional[LineCounter] = None) -> None:
+    def __init__(self, camera_id: str, tracker: PersonTracker, line: Optional[LineCounter] = None) -> None:
         self.camera_id = camera_id
         self.tracker = tracker
-        self.zone = zone
+        self.line = line
         self.crossings: List[Crossing] = []   # confirmed but not yet written to the DB
         self.current = 0
         self.total_persons = 0     # since start-up
@@ -79,18 +79,18 @@ class CameraCounter:
         if self._interval is None:
             self._interval = _Interval(ts)
         self._interval.add(count, new, ts)
-        if self.zone is not None:
+        if self.line is not None:
             # Tracks matched or created on this frame carry this frame's timestamp.
             seen = [t for t in self.tracker.tracks if t.last_seen == mono_ts]
             boxes_seen = np.stack([t.bbox for t in seen]) if seen else np.zeros((0, 4), np.float32)
-            crossed = self.zone.update([t.track_id for t in seen], boxes_seen, ts,
+            crossed = self.line.update([t.track_id for t in seen], boxes_seen, ts,
                                        alive_ids=[t.track_id for t in self.tracker.tracks])
             for c in crossed:
                 if c.direction == "in":
                     self._interval.ins += 1
                 else:
                     self._interval.outs += 1
-            self._interval.zone = self.zone.inside_now
+            self._interval.inside = self.line.inside_now
             self.crossings.extend(crossed)
         self.current = count
         self.total_persons += new
@@ -103,7 +103,7 @@ class CameraCounter:
         if iv is None or iv.frames == 0:
             return None
         return CountRecord(self.camera_id, iv.start, max(iv.end, now), iv.frames, iv.last, iv.min, iv.max,
-                           iv.total / iv.frames, iv.new, iv.ins, iv.outs, iv.zone)
+                           iv.total / iv.frames, iv.new, iv.ins, iv.outs, iv.inside)
 
     def take_crossings(self) -> List[Crossing]:
         out, self.crossings = self.crossings, []
@@ -112,8 +112,8 @@ class CameraCounter:
     def stats(self) -> dict:
         d = {"current": self.current, "total_persons": self.total_persons, "peak": self.peak,
              "tracks": self.tracker.active, "last_update": self.last_update}
-        if self.zone is not None:
-            d.update({"in": self.zone.total_in, "out": self.zone.total_out, "inside": self.zone.inside_now})
+        if self.line is not None:
+            d.update({"in": self.line.total_in, "out": self.line.total_out, "inside": self.line.inside_now})
         return d
 
 
@@ -124,7 +124,7 @@ class PersonCounter:
                  track_max_age_s: float = 2.0, track_min_hits: int = 2,
                  lines: Optional[Dict[str, Sequence[float]]] = None, anchor: str = "bottom",
                  min_frames: int = 2, min_distance: float = 4.0,
-                 in_directions: Optional[Dict[str, str]] = None) -> None:
+                 in_directions: Optional[Dict[str, str]] = None, count_once: bool = True) -> None:
         """lines: camera_id -> [x1, y1, x2, y2] in frame pixels (cameras without one count no IN/OUT).
         in_directions: camera_id -> down | up | right | left (the crossing that is IN; default down)."""
         self.interval_s = interval_s
@@ -133,7 +133,8 @@ class PersonCounter:
         dirs = in_directions or {}
         self.cameras: Dict[str, CameraCounter] = {
             cid: CameraCounter(cid, PersonTracker(track_iou, track_max_age_s, track_min_hits),
-                               LineCounter(cid, lines[cid], dirs.get(cid) or "down", anchor, min_frames, min_distance)
+                               LineCounter(cid, lines[cid], dirs.get(cid) or "down", anchor, min_frames, min_distance,
+                                           count_once)
                                if lines.get(cid) else None)
             for cid in camera_ids
         }
@@ -152,16 +153,16 @@ class PersonCounter:
                 if cam is None:
                     continue
                 cam.total_persons = vals.get("total", cam.total_persons)
-                if cam.zone is not None:
-                    cam.zone.total_in = vals.get("in", cam.zone.total_in)
-                    cam.zone.total_out = vals.get("out", cam.zone.total_out)
+                if cam.line is not None:
+                    cam.line.total_in = vals.get("in", cam.line.total_in)
+                    cam.line.total_out = vals.get("out", cam.line.total_out)
                 seeded.append(cid)
         return seeded
 
     def in_out_totals(self) -> Dict[str, Tuple[int, int]]:
         """Running IN / OUT totals of the cameras that have a count line."""
         with self._lock:
-            return {cid: (c.zone.total_in, c.zone.total_out) for cid, c in self.cameras.items() if c.zone is not None}
+            return {cid: (c.line.total_in, c.line.total_out) for cid, c in self.cameras.items() if c.line is not None}
 
     def due(self) -> bool:
         return time.monotonic() - self._last_flush >= self.interval_s

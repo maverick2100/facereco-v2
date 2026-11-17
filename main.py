@@ -10,7 +10,6 @@ Usage:
     python main.py enroll --name "Alice" --images a.jpg b.jpg
     python main.py persons                   # list enrolled people
     python main.py delete-person 3
-    python main.py export --since 2026-11-13 # CSV into data/exports/
     python main.py counts --since 2026-11-13 # person totals per camera (--csv for all rows)
     python main.py info                      # model + environment info
     python main.py run --show                # same, plus a window with live boxes + names (q to quit)
@@ -19,7 +18,7 @@ Usage:
     python main.py cameras                   # what the camera source (cameras.yaml or your SP) returns
     python main.py api                       # HTTP API for the frontend (cameras in, dashboard out) on :8090
     python main.py run --api                 # pipelines + the API in one process
-    python main.py db-setup                  # create camera_config + the SPs in PostgreSQL (--force: re-apply)
+    python main.py db-setup                  # install the SPs in PostgreSQL (no tables; --force: re-apply)
 
 `run` follows the camera source: with FR_CAMERA_SOURCE=db it calls your stored procedure, starts face
 recognition / person counting per camera as the SP says, and restarts the pipelines when the SP's
@@ -55,12 +54,10 @@ from config.settings import Settings, load_settings  # noqa: E402
 from constants import ENROLLMENT_DIR, EXPORTS_DIR  # noqa: E402
 from database.camera_repository import CameraRepository  # noqa: E402
 from database.connection import open_database  # noqa: E402
-from database.embedding_repository import EmbeddingRepository  # noqa: E402
-from database.event_repository import EventRepository  # noqa: E402
-from database.offender_repository import offender_table_sql  # noqa: E402
+from database.offender_repository import (OffenderRepository, offender_search_log_table_sql,  # noqa: E402
+                                          offender_table_sql)
 from database.person_count_repository import PersonCountRepository  # noqa: E402
 from database.person_repository import PersonRepository  # noqa: E402
-from database.schema import init_schema  # noqa: E402
 from ingestion.camera_health import CameraHealthRegistry  # noqa: E402
 from ingestion.frame_receiver import FrameReceiver, OpenCVManager  # noqa: E402
 from inference.inference_manager import InferenceManager  # noqa: E402
@@ -70,7 +67,6 @@ from person_detection.person_count_service import PersonCountService, load_yolo 
 from recognition.duplicate_filter import DuplicateFilter, TrackCache  # noqa: E402
 from scheduler.frame_scheduler import FrameScheduler  # noqa: E402
 from services.enrollment_service import EnrollmentService  # noqa: E402
-from services.event_service import EventService  # noqa: E402
 from services.live_view import LiveView  # noqa: E402
 from ingestion.camera_pipeline import mask_url  # noqa: E402
 from services.camera_source import CameraSource, describe_change, fingerprint  # noqa: E402
@@ -91,16 +87,12 @@ class FaceRecognitionApp:
         self.person_cameras = [c for c in self.cameras if c.runs_person]
         self.perf = PerformanceTracker()
         self.db = open_database(settings.storage)
-        init_schema(self.db)
         log.info("Database: %s", self.db.description)
         self.camera_repo = CameraRepository(self.db)
         self.person_repo = PersonRepository(self.db)
-        self.embedding_repo = EmbeddingRepository(self.db)
-        self.event_repo = EventRepository(self.db)
         self.person_count_repo = PersonCountRepository(self.db)
 
         self.inference = InferenceManager(settings.models, settings.detection, self.perf)
-        self.events = EventService(self.event_repo, settings.storage, self.perf)
         self.health_registry = CameraHealthRegistry()
         self.scheduler = FrameScheduler(max_frame_age_s=settings.detection.max_frame_age_s)
         person_fps = settings.person.max_fps
@@ -166,7 +158,7 @@ class FaceRecognitionApp:
                                          s.recognition.unknown_similarity)
             tracks = TrackCache(s.recognition.track_iou, s.recognition.track_reverify_s)
             self.recognition = RecognitionService(
-                self.inference, self.scheduler, None, None, duplicates, tracks, self.events,
+                self.inference, self.scheduler, OffenderRepository(self.db), duplicates, tracks,
                 self.face_cameras, s.detection, s.recognition, self.perf, s.storage.save_snapshots,
                 live=self.live,
             )
@@ -228,7 +220,6 @@ class FaceRecognitionApp:
                     component.stop()
                 except Exception:
                     log.exception("error stopping %s", type(component).__name__)
-        self.events.stop()
         self.db.close()
         log.info("Stopped")
 
@@ -236,8 +227,7 @@ class FaceRecognitionApp:
 # ---------------------------------------------------------------------- commands
 def _repos(settings: Settings):
     db = open_database(settings.storage)
-    init_schema(db)
-    return db, PersonRepository(db), EmbeddingRepository(db), EventRepository(db)
+    return db, PersonRepository(db)
 
 
 class Supervisor:
@@ -370,7 +360,7 @@ class Supervisor:
 
 
 def _auto_setup_sql(settings: Settings) -> None:
-    """FR_CAMERA_SOURCE=db on PostgreSQL: create camera_config + the SPs if they're missing."""
+    """FR_CAMERA_SOURCE=db on PostgreSQL: install the camera SPs if they're missing (never tables)."""
     if not settings.api.auto_setup or settings.camera_source.source != "db" or \
             settings.storage.backend != "postgres" or "sp_get_cameras" not in settings.camera_source.sql:
         return                                       # your own SP (e.g. fn_get_device_configuration): leave the DB alone
@@ -381,7 +371,7 @@ def _auto_setup_sql(settings: Settings) -> None:
         db = open_database(settings.storage)
         ensure_sql_objects(db)
     except Exception as exc:
-        log.warning("Could not create camera_config / SPs (%s) - run: python main.py db-setup", exc)
+        log.warning("Could not install the camera SPs (%s) - run: python main.py db-setup", exc)
     finally:
         if db is not None:
             db.close()
@@ -449,52 +439,42 @@ def cmd_cameras(settings: Settings, args) -> int:
 
 
 def cmd_enroll(settings: Settings, args) -> int:
-    db, persons, embeddings, _ = _repos(settings)
+    db = open_database(settings.storage)
     inference = InferenceManager(settings.models, settings.detection).load()
-    svc = EnrollmentService(inference, persons, embeddings)
+    svc = EnrollmentService(inference, db)
     if args.name:
         if not args.images:
             print("--images is required with --name")
             return 2
-        results = [svc.enroll_images(args.name, [Path(p) for p in args.images], args.external_id, args.replace)]
+        results = [svc.enroll_images(args.name, [Path(p) for p in args.images], replace=args.replace)]
     else:
         results = svc.enroll_directory(Path(args.dir), replace=args.replace)
     for r in results:
-        print(f"{r.name:<30} id={r.person_id:<5} added={r.added:<3} skipped={r.skipped:<3} errors={len(r.errors)}")
+        ids = ",".join(map(str, r.offender_ids)) or "-"
+        print(f"{r.name:<30} added={r.added:<3} skipped={r.skipped:<3} errors={len(r.errors)}  offender_ids={ids}")
     db.close()
     return 0 if results else 1
 
 
 def cmd_persons(settings: Settings, args) -> int:
-    db, persons, embeddings, _ = _repos(settings)
+    db, persons = _repos(settings)
     for p in persons.list(active_only=not args.all):
-        print(f"{p['id']:>5}  {p['name']:<30} embeddings={embeddings.count_for(p['id']):<4} "
+        print(f"{p['id']:>5}  {p['name']:<30} "
               f"active={bool(p['active'])}  external_id={p['external_id'] or ''}")
     db.close()
     return 0
 
 
 def cmd_delete_person(settings: Settings, args) -> int:
-    db, persons, _, _ = _repos(settings)
+    db, persons = _repos(settings)
     ok = persons.delete(args.person_id)
     print("deleted" if ok else "not found")
     db.close()
     return 0 if ok else 1
 
 
-def cmd_export(settings: Settings, args) -> int:
-    db, _, _, events = _repos(settings)
-    svc = EventService(events, settings.storage)
-    path = svc.export_csv(Path(args.out) if args.out else None, parse_datetime(args.since),
-                          parse_datetime(args.until), args.camera, args.known_only)
-    print(path)
-    db.close()
-    return 0
-
-
 def cmd_counts(settings: Settings, args) -> int:
     db = open_database(settings.storage)
-    init_schema(db)
     repo = PersonCountRepository(db)
     since, until = parse_datetime(args.since), parse_datetime(args.until)
     if args.csv is not None:
@@ -538,13 +518,14 @@ def cmd_info(settings: Settings, args) -> int:
 def cmd_db_check(settings: Settings, args) -> int:
     try:
         db = open_database(settings.storage)
-        init_schema(db)
-        counts = {t: db.fetchone(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in ("persons", "embeddings", "cameras")}
+        tables = [offender_table_sql(), offender_search_log_table_sql()]
+        counts = {t: db.fetchone(f"SELECT COUNT(*) AS n FROM {t}")["n"] for t in tables}
     except Exception as exc:
         print(f"FAILED: {exc}")
         return 1
     print(f"OK  {db.description}")
-    print(f"    persons={counts['persons']} embeddings={counts['embeddings']} cameras={counts['cameras']}")
+    for t, n in counts.items():
+        print(f"    {t}: {n} rows")
     db.close()
     return 0
 
@@ -565,21 +546,13 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--dir", default=str(ENROLLMENT_DIR), help="folder with one sub-folder per person")
     e.add_argument("--name", help="person name (enrol specific images)")
     e.add_argument("--images", nargs="*", help="image files for --name")
-    e.add_argument("--external-id", help="optional external/employee id")
-    e.add_argument("--replace", action="store_true", help="replace existing embeddings")
+    e.add_argument("--replace", action="store_true", help="deactivate this name's existing tbl_offenders rows and add these photos")
 
     ps = sub.add_parser("persons", help="list persons")
     ps.add_argument("--all", action="store_true", help="include inactive")
 
-    d = sub.add_parser("delete-person", help="delete a person and their embeddings")
+    d = sub.add_parser("delete-person", help="delete a person")
     d.add_argument("person_id", type=int)
-
-    x = sub.add_parser("export", help="export events to CSV")
-    x.add_argument("--since")
-    x.add_argument("--until")
-    x.add_argument("--camera")
-    x.add_argument("--known-only", action="store_true")
-    x.add_argument("--out")
 
     c = sub.add_parser("counts", help="person-count totals per camera (or --csv for every row)")
     c.add_argument("--since")
@@ -590,13 +563,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("info", help="show model/environment info")
     sub.add_parser("cameras", help="list the cameras + use cases the camera source (yaml or SP) returns")
 
-    sub.add_parser("db-check", help="test the database connection and create tables")
+    sub.add_parser("db-check", help="test the database connection (creates no tables)")
 
     a = sub.add_parser("api", help="HTTP API for the frontend (docs at /docs)")
     a.add_argument("--host", help="bind address (default FR_API_HOST)")
     a.add_argument("--port", type=int, help="port (default FR_API_PORT)")
 
-    ds = sub.add_parser("db-setup", help="create camera_config + stored procedures in PostgreSQL")
+    ds = sub.add_parser("db-setup", help="install stored procedures in PostgreSQL (creates no tables)")
     ds.add_argument("--force", action="store_true", help="re-apply the SQL files even if the objects exist")
     return p
 
@@ -608,7 +581,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_logging(settings.logging_config, settings.log_level)
     commands = {
         None: cmd_run, "run": cmd_run, "enroll": cmd_enroll, "persons": cmd_persons,
-        "delete-person": cmd_delete_person, "export": cmd_export, "counts": cmd_counts, "info": cmd_info,
+        "delete-person": cmd_delete_person, "counts": cmd_counts, "info": cmd_info,
         "cameras": cmd_cameras,
         "db-check": cmd_db_check, "api": cmd_api, "db-setup": cmd_db_setup,
     }

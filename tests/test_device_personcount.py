@@ -3,7 +3,7 @@ from config.settings import CameraConfig, PersonSettings
 from database.person_count_repository import parse_initial_totals
 from person_detection.person_count_service import PersonCountService
 
-ZONE = [[0, 0], [100, 0], [100, 100], [0, 100]]
+LINE = [0, 50, 100, 50]          # count line [x1, y1, x2, y2]
 
 
 class FakeRepo:
@@ -26,8 +26,8 @@ class FakeRepo:
 
 
 def _service(repo, cams=None):
-    cams = cams or [CameraConfig.from_dict({"camera_id": "2", "url": "x", "tasks": ["person"], "count_zone": ZONE}),
-                    CameraConfig.from_dict({"camera_id": "3", "url": "y", "tasks": ["person"], "count_zone": ZONE})]
+    cams = cams or [CameraConfig.from_dict({"camera_id": "2", "url": "x", "tasks": ["person"], "roi": LINE}),
+                    CameraConfig.from_dict({"camera_id": "3", "url": "y", "tasks": ["person"], "roi": LINE})]
     return PersonCountService(engine=None, frames=None, repo=repo, cameras=cams, settings=PersonSettings())
 
 
@@ -48,7 +48,7 @@ def test_starts_from_sp_totals_then_calls_update_sp_only_on_change():
     svc._push_totals()                       # nothing changed since start -> no SP call
     assert repo.calls == []
 
-    svc.counter.cameras["2"].zone.total_in += 1   # someone walks in on device 2
+    svc.counter.cameras["2"].line.total_in += 1   # someone walks in on device 2
     svc._push_totals()
     sql, (device, n_in, n_out, stamp) = repo.calls[-1]
     assert sql == "CALL sp_upsert_person_count_update(?, ?, ?, ?)"
@@ -90,7 +90,7 @@ class FakeTable:
 
 def _table_service(table, cams=None):
     cams = cams or [CameraConfig.from_dict({"camera_id": "16", "url": "x", "tasks": ["person"],
-                                            "count_zone": ZONE, "gate_id": 11})]
+                                            "roi": LINE, "gate_id": 11})]
     return PersonCountService(engine=None, frames=None, repo=FakeRepo([]), cameras=cams,
                               settings=PersonSettings(), table=table)
 
@@ -103,7 +103,7 @@ def test_table_mode_continues_from_today_and_writes_in_out_rows():
     svc._push_totals()
     assert table.rows == []                                   # nothing new yet
 
-    svc.counter.cameras["16"].zone.total_in += 1
+    svc.counter.cameras["16"].line.total_in += 1
     svc._push_totals()
     today = _dt.date.today()
     assert table.rows == [(11, 16, "In", 799, 1, today)]     # only the direction that changed
@@ -111,10 +111,10 @@ def test_table_mode_continues_from_today_and_writes_in_out_rows():
 
 def test_table_mode_first_write_of_day_creates_both_rows_and_uses_last_gate():
     table = FakeTable(gate=3)
-    cams = [CameraConfig.from_dict({"camera_id": "4", "url": "x", "tasks": ["person"], "count_zone": ZONE})]
+    cams = [CameraConfig.from_dict({"camera_id": "4", "url": "x", "tasks": ["person"], "roi": LINE})]
     svc = _table_service(table, cams)
     svc.load_initial_totals()
-    svc.counter.cameras["4"].zone.total_out += 1
+    svc.counter.cameras["4"].line.total_out += 1
     svc._push_totals()
     today = _dt.date.today()
     assert table.rows == [(3, 4, "In", 0, 0, today), (3, 4, "Out", 1, 1, today)]
@@ -125,10 +125,10 @@ def test_table_mode_resets_on_new_business_date():
     svc = _table_service(table)
     svc.load_initial_totals()
     svc._day = _dt.date.today() - _dt.timedelta(days=1)       # midnight passed
-    svc.counter.cameras["16"].zone.total_in += 1              # crossing just after midnight
+    svc.counter.cameras["16"].line.total_in += 1              # crossing just after midnight
     svc._push_totals()
     assert svc.counter.in_out_totals() == {"16": (0, 0)}       # reset; next crossing counts from 0
-    svc.counter.cameras["16"].zone.total_in += 1
+    svc.counter.cameras["16"].line.total_in += 1
     svc._push_totals()
     today = _dt.date.today()
     assert table.rows == [(11, 16, "In", 1, 1, today), (11, 16, "Out", 0, 0, today)]
